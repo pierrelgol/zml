@@ -28,7 +28,10 @@ pub const DiffusionGemmaConfig = struct {
         pub const jsonStringify = Helpers.jsonStringify;
     };
 
-    pub const LayerType = enum { sliding_attention, full_attention };
+    pub const LayerType = enum {
+        sliding_attention,
+        full_attention,
+    };
 
     pub const RopeParameters = struct {
         sliding_attention: zml.nn.RopeOpts.Scaling,
@@ -59,17 +62,25 @@ pub const DiffusionGemmaConfig = struct {
         sliding_window: u64,
         layer_types: []const LayerType,
         final_logit_softcapping: f32,
-        use_bidirectional_attension: ?enum { all, vision },
+        use_bidirectional_attention: ?enum { all, vision },
         num_experts: u64,
         top_k_experts: u64,
-        moe_intermediate_sizes: u64,
+        moe_intermediate_size: u64,
         rope_parameters: RopeParameters,
     };
+
+    pub fn format(self: @This(), w: *std.Io.Writer) !void {
+        try std.json.Stringify.value(self, .{}, w);
+    }
 };
 
 const Options = struct {
     sampling_strategy: ?zml.nn.SamplingStrategy,
     max_seq_len: u32,
+
+    pub fn format(self: @This(), w: *std.Io.Writer) !void {
+        try std.json.Stringify.value(self, .{}, w);
+    }
 };
 
 pub const LoadedModel = struct {
@@ -137,6 +148,25 @@ pub const LoadedModel = struct {
     pub fn unloadBuffers(_: *const LoadedModel, buffers: *Buffers, allocator: std.mem.Allocator) void {
         Model.unloadBuffers(buffers, allocator);
     }
+
+    pub fn compile(
+        self: *const LoadedModel,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        platform: *const zml.Platform,
+        backend: zml.attention.Backend,
+        meshes: common.Meshes,
+        seqlen: usize,
+        progress: *std.Progress.Node,
+    ) !inference.CompiledModel {
+        _ = backend;
+        const experts_dtype = self.inner.text_model.layers[0].experts.gate_up_proj.dtype();
+        const moe_backend = zml.moe.Backend.auto(platform, null, experts_dtype) catch .stablehlo;
+        log.info("Selected MoE backend: {}", .{moe_backend});
+
+        const params: inference.CompilationParameters = .init(self.inner, self.parsed_config.value, @intCast(seqlen), moe_backend, meshes);
+        return .init(allocator, io, platform, self, self.inner, params, progress);
+    }
 };
 
 pub const Buffers = zml.Bufferized(Model);
@@ -184,18 +214,23 @@ pub const Model = struct {
         active_length: zml.Tensor,
         kv_cache: KvCache,
         rng: zml.Tensor.Rng,
-        attention_metadata: zml.attention.Metadata,
-        attention_parameters: zml.attention.Parameters,
+        moe_backend: zml.moe.Backend,
     ) struct { zml.Tensor, KvCache, zml.Tensor.Rng } {
-        _ = self;
-        _ = tokens;
-        _ = token_index;
-        _ = active_length;
-        _ = kv_cache;
-        _ = rng;
-        _ = attention_metadata;
-        _ = attention_parameters;
-        @panic("TODO");
+        const hidden, const updated_kv_cache = self.text_model.forward(
+            tokens.withPartialTags(.{.s}),
+            token_index,
+            kv_cache,
+            moe_backend,
+        );
+
+        const sample = LmHead.forward(.{
+            .lm_head = self.lmHead(),
+            .hidden = hidden,
+            .active_length = active_length,
+            .rng = rng,
+        });
+
+        return .{ sample.tokens, updated_kv_cache, sample.rng };
     }
 };
 
@@ -229,7 +264,10 @@ pub const TextModel = struct {
             .embed_tokens = .{
                 .weight = store.createTensor(
                     "embed_tokens.weight",
-                    .{ .voc, .d },
+                    .{
+                        .voc,
+                        .d,
+                    },
                     .model,
                     .{
                         .voc = .replicated,
@@ -264,16 +302,41 @@ pub const TextModel = struct {
         tokens: zml.Tensor,
         token_index: zml.Tensor,
         kv_cache: KvCache,
-        attention_metadata: zml.attention.Metadata,
-        attention_parameters: zml.attention.Parameters,
+        moe_backend: zml.moe.Backend,
     ) struct { zml.Tensor, KvCache } {
-        _ = self;
-        _ = tokens;
-        _ = token_index;
-        _ = kv_cache;
-        _ = attention_metadata;
-        _ = attention_parameters;
-        @panic("TODO");
+        // HF casts embed_scale to the weight dtype before multiplying.
+        var hidden = self.embed_tokens.forward(tokens)
+            .scale(self.embed_scale)
+            .withPartitioning(.model, .{ .d = .replicated });
+
+        var updated_kv_cache = kv_cache;
+        var num_sliding: u32 = 0;
+        var num_full: u32 = 0;
+        for (self.layers) |layer| {
+            const kv_cache_index: u32 = switch (layer.self_attn.layer_type) {
+                .sliding_attention => b: {
+                    defer num_sliding += 1;
+                    break :b num_sliding;
+                },
+                .full_attention => b: {
+                    defer num_full += 1;
+                    break :b num_full;
+                },
+            };
+
+            const result = TransformerLayer.forward(.{
+                .layer = layer,
+                .hidden = hidden,
+                .token_index = token_index,
+                .kv_cache = updated_kv_cache,
+                .kv_cache_index = .scalar(kv_cache_index, .u32),
+                .moe_backend = moe_backend,
+            });
+            hidden = result.hidden;
+            updated_kv_cache = result.kv_cache;
+        }
+
+        return .{ self.norm.forward(hidden), updated_kv_cache.reuseBuffer(kv_cache) };
     }
 };
 
@@ -303,8 +366,20 @@ pub const LmHead = struct {
     };
 
     pub fn forward(input: Input) Output {
-        _ = input;
-        @panic("TODO");
+        const self = input.lm_head;
+        const last_index = input.active_length.convert(.i32).addConstant(-1);
+        const hidden = input.hidden
+            .slice(.s, .dyn(last_index, 1))
+            .withPartitioning(.model, .{ .d = .replicated });
+        const logits = hidden.dot(self.embed_tokens.weight.convert(hidden.dtype()), .d).convert(.f32);
+        const cap = self.final_logit_softcapping;
+        const capped = logits.scale(1.0 / cap).tanh().scale(cap);
+        const new_tokens, const new_rng = zml.nn.sampleTokens(capped, self.gen_opts, input.rng);
+
+        return .{
+            .tokens = new_tokens.convert(.u32),
+            .rng = new_rng,
+        };
     }
 };
 
@@ -360,10 +435,8 @@ pub const TransformerLayer = struct {
         hidden: zml.Tensor,
         token_index: zml.Tensor,
         kv_cache: KvCache,
-
         kv_cache_index: zml.Tensor,
-        attention_metadata: zml.attention.Metadata,
-        attention_parameters: zml.attention.Parameters,
+        moe_backend: zml.moe.Backend,
     };
 
     pub const Output = struct {
@@ -371,9 +444,32 @@ pub const TransformerLayer = struct {
         kv_cache: KvCache,
     };
 
+    /// hidden: {.s, .d} -> {.s, .d}
     pub fn forward(input: Input) Output {
-        _ = input;
-        @panic("TODO");
+        const self = input.layer;
+        const x0 = input.hidden.withPartitioning(.model, .{ .d = .replicated });
+
+        const attn, const updated_kv_cache = self.self_attn.forward(
+            self.input_layernorm.forward(x0),
+            input.token_index,
+            input.kv_cache,
+            input.kv_cache_index,
+        );
+        const x1 = x0.add(self.post_attention_layernorm.forward(attn));
+
+        // The dense MLP and the MoE both read the post-attention residual and are summed.
+        const dense = self.post_feedforward_layernorm_1.forward(self.mlp.forward(self.pre_feedforward_layernorm.forward(x1)));
+        const routing = self.router.forward(x1);
+        const sparse = self.post_feedforward_layernorm_2.forward(
+            self.experts.forward(self.pre_feedforward_layernorm_2.forward(x1), routing, input.moe_backend),
+        );
+        const x2 = x1.add(self.post_feedforward_layernorm.forward(dense.add(sparse)));
+
+        const layer_scalar = self.layer_scalar.asScalar().convert(x2.dtype()).broad(x2.shape());
+        return .{
+            .hidden = x2.mul(layer_scalar).withPartitioning(.model, .{ .d = .replicated }),
+            .kv_cache = updated_kv_cache,
+        };
     }
 };
 
@@ -428,7 +524,10 @@ pub const SelfAttn = struct {
             .head_dim = @intCast(head_dim),
             .sliding_window = @intCast(text_config.sliding_window),
             .rope_opts = .{
-                .layout = .real_im_pass,
+                .layout = switch (layer_type) {
+                    .sliding_attention => .real_im_pass,
+                    .full_attention => .real_pass_im_pass,
+                },
                 .scaling = rope_scaling,
             },
         };
@@ -444,17 +543,71 @@ pub const SelfAttn = struct {
         token_index: zml.Tensor,
         kv_cache: KvCache,
         kv_cache_index: zml.Tensor,
-        attention_metadata: zml.attention.Metadata,
-        attention_parameters: zml.attention.Parameters,
     ) struct { zml.Tensor, KvCache } {
-        _ = self;
-        _ = x;
-        _ = token_index;
-        _ = kv_cache;
-        _ = kv_cache_index;
-        _ = attention_metadata;
-        _ = attention_parameters;
-        @panic("TODO");
+        const x_qkv = x.withPartitioning(.model, .{ .d = .replicated });
+
+        var q = self.q_proj.forward(x_qkv, x_qkv.dtype()).splitAxis(-1, .{ .h = self.num_heads, .hd = .auto });
+        var k = self.k_proj.forward(x_qkv, x_qkv.dtype()).splitAxis(-1, .{ .h = self.num_kv_heads, .hd = .auto });
+        var v = if (self.v_proj) |v_proj|
+            v_proj.forward(x_qkv, x_qkv.dtype()).splitAxis(-1, .{ .h = self.num_kv_heads, .hd = .auto })
+        else
+            k;
+
+        q = self.q_norm.forward(q.rename(.{ .hd = .d })).rename(.{ .d = .hd });
+        k = self.k_norm.forward(k.rename(.{ .hd = .d })).rename(.{ .d = .hd });
+        v = self.v_norm.forward(v.rename(.{ .hd = .d })).rename(.{ .d = .hd });
+
+        const pos_index = b: {
+            const temp = zml.Tensor.arange(.{ .end = x.dim(.s) }, token_index.dtype()).withTags(.{.s}).broad(zml.Shape.init(.{ .s = x.dim(.s) }, token_index.dtype()));
+            break :b temp.add(token_index.broad(temp.shape()));
+        };
+        q = zml.nn.rope(q, pos_index, self.rope_opts).rename(.{ .s = .q });
+        k = zml.nn.rope(k, pos_index, self.rope_opts).rename(.{ .s = .k });
+        v = v.rename(.{ .s = .k });
+
+        const dtype = q.dtype();
+        const layer_cache = switch (self.layer_type) {
+            .sliding_attention => kv_cache.sliding,
+            .full_attention => kv_cache.full,
+        };
+
+        const new_layer_cache = layer_cache.updateAt(k, v, token_index, kv_cache_index);
+        k = new_layer_cache.keysAt(kv_cache_index).convert(dtype);
+        v = new_layer_cache.valuesAt(kv_cache_index).convert(dtype);
+
+        const seq_len = k.dim(.k);
+        const window: ?u32 = switch (self.layer_type) {
+            .sliding_attention => @intCast(self.sliding_window),
+            .full_attention => null,
+        };
+
+        var attn_mask = zml.nn.causalAttnMask(.{ .q = seq_len, .k = seq_len }, dtype, window);
+        attn_mask = attn_mask.gatherSlices(zml.Shape.init(.{ .q = q.dim(.q) }, attn_mask.dtype()), token_index.appendAxes(.{.coord}), .{});
+
+        const last_position = token_index.convert(.i32).addConstant(q.dim(.q) - 1);
+        const written = zml.Tensor.iota(k.shape(), .k).cmp(.LE, last_position.broad(k.shape().withDtype(.i32)));
+        k = written.select(k, .zeroes(k.shape()));
+        v = written.select(v, .zeroes(v.shape()));
+
+        const attn_output = zml.nn.sdpa(q, k, v, .{
+            .attn_mask = attn_mask,
+            .scale = .scalar(1.0, dtype),
+        });
+
+        const attn = attn_output.merge(.{ .d = .{ .h, .hd } }).rename(.{ .q = .s });
+        const delta = self.o_proj.forward(attn, attn.dtype())
+            .rename(.{ .dout = .d })
+            .withPartitioning(.model, .{ .d = .replicated });
+
+        var new_kv_cache = kv_cache;
+        switch (self.layer_type) {
+            .sliding_attention => new_kv_cache.sliding = new_layer_cache,
+            .full_attention => new_kv_cache.full = new_layer_cache,
+        }
+        return .{
+            delta,
+            new_kv_cache,
+        };
     }
 };
 
@@ -476,9 +629,12 @@ pub const Mlp = struct {
     }
 
     pub fn forward(self: Mlp, x: zml.Tensor) zml.Tensor {
-        _ = self;
-        _ = x;
-        @panic("TODO");
+        const gate = self.gate_proj.forward(x, x.dtype());
+        const up = self.up_proj.forward(x, x.dtype());
+        const activated = gate.gelu().mul(up).rename(.{ .dout = .d });
+        return self.down_proj.forward(activated, activated.dtype())
+            .rename(.{ .dout = .d })
+            .withPartitioning(.model, .{ .d = .replicated });
     }
 };
 
@@ -509,9 +665,21 @@ pub const Router = struct {
     };
 
     pub fn forward(self: Router, x: zml.Tensor) Output {
-        _ = self;
-        _ = x;
-        @panic("TODO");
+        const root_size = 1.0 / @sqrt(@as(f32, @floatFromInt(x.dim(.d))));
+        const normalized = self.norm.forward(x);
+        const scaled = normalized.mul(self.scale.convert(normalized.dtype()).broad(normalized.shape())).scale(root_size);
+
+        const probs = self.proj.forward(scaled, scaled.dtype()).convert(.f32).softmax(.expert);
+        const top_k = probs.topK(.{ .topk = .expert }, self.top_k, .{});
+        const indices = top_k.indices.convert(.i32);
+
+        const renormalized = top_k.values.div(top_k.values.sum(.topk).broad(top_k.values.shape()));
+        const per_expert_scale = self.per_expert_scale.convert(.f32).gather(.{ .expert = indices }, .{});
+
+        return .{
+            .weights = renormalized.mul(per_expert_scale),
+            .indices = indices,
+        };
     }
 };
 
@@ -521,8 +689,34 @@ pub const Experts = struct {
 
     pub fn init(store: zml.io.TensorStore.View) Experts {
         return .{
-            .gate_up_proj = store.createTensor("gate_up_proj", .{ .expert, .dout, .d }, .experts, .{ .expert = .experts, .dout = .replicated, .d = .replicated }),
-            .down_proj = store.createTensor("down_proj", .{ .expert, .d, .dout }, .experts, .{ .expert = .experts, .d = .replicated, .dout = .replicated }),
+            .gate_up_proj = store.createTensor(
+                "gate_up_proj",
+                .{
+                    .expert,
+                    .dout,
+                    .d,
+                },
+                .experts,
+                .{
+                    .expert = .experts,
+                    .dout = .replicated,
+                    .d = .replicated,
+                },
+            ),
+            .down_proj = store.createTensor(
+                "down_proj",
+                .{
+                    .expert,
+                    .d,
+                    .dout,
+                },
+                .experts,
+                .{
+                    .expert = .experts,
+                    .d = .replicated,
+                    .dout = .replicated,
+                },
+            ),
         };
     }
 
@@ -530,11 +724,20 @@ pub const Experts = struct {
         zml.Buffer.deinitAll(Experts, self);
     }
 
-    pub fn forward(self: Experts, x: zml.Tensor, routing: Router.Output) zml.Tensor {
-        _ = self;
-        _ = x;
-        _ = routing;
-        @panic("TODO");
+    pub fn forward(self: Experts, x: zml.Tensor, routing: Router.Output, moe_backend: zml.moe.Backend) zml.Tensor {
+        return zml.moe.forwardMoe(
+            x.rename(.{ .s = .t }),
+            routing.indices.rename(.{ .s = .t }),
+            routing.weights.rename(.{ .s = .t }),
+            .init(self.gate_up_proj, null, .d),
+            .init(self.down_proj, null, .dout),
+            moe_backend,
+            .{
+                .activation = .geglu_tanh,
+                .quantize_input = false,
+                .routing_weight_placement = .after_down,
+            },
+        ).rename(.{ .t = .s });
     }
 };
 
@@ -550,7 +753,10 @@ pub const RmsNorm = struct {
     }
 
     pub fn initNoScale(eps: f32) RmsNorm {
-        return .{ .weight = null, .eps = eps };
+        return .{
+            .weight = null,
+            .eps = eps,
+        };
     }
 
     pub fn unloadBuffers(self: *zml.Bufferized(RmsNorm)) void {
@@ -574,24 +780,37 @@ pub const KvCache = struct {
         const text_config = config.text_config;
         var num_sliding: i64 = 0;
         var num_full: i64 = 0;
+
         for (text_config.layer_types) |layer_type| switch (layer_type) {
             .sliding_attention => num_sliding += 1,
             .full_attention => num_full += 1,
         };
 
         return .{
-            .sliding = .init(.init(.{
-                .layer = num_sliding,
-                .k = seqlen,
-                .h = text_config.num_key_value_heads,
-                .hd = text_config.head_dim,
-            }, dtype), mesh),
-            .full = .init(.init(.{
-                .layer = num_full,
-                .k = seqlen,
-                .h = text_config.num_global_key_value_heads,
-                .hd = text_config.global_head_dim,
-            }, dtype), mesh),
+            .sliding = .init(
+                .init(
+                    .{
+                        .layer = num_sliding,
+                        .k = seqlen,
+                        .h = text_config.num_key_value_heads,
+                        .hd = text_config.head_dim,
+                    },
+                    dtype,
+                ),
+                mesh,
+            ),
+            .full = .init(
+                .init(
+                    .{
+                        .layer = num_full,
+                        .k = seqlen,
+                        .h = text_config.num_global_key_value_heads,
+                        .hd = text_config.global_head_dim,
+                    },
+                    dtype,
+                ),
+                mesh,
+            ),
         };
     }
 
@@ -653,7 +872,13 @@ pub const KvCache = struct {
             return kv.v.slice(.layer, .dynSingle(layer_index));
         }
 
-        pub fn updateAt(kv: LayerCache, new_k: zml.Tensor, new_v: zml.Tensor, token_index: zml.Tensor, layer_index: zml.Tensor) LayerCache {
+        pub fn updateAt(
+            kv: LayerCache,
+            new_k: zml.Tensor,
+            new_v: zml.Tensor,
+            token_index: zml.Tensor,
+            layer_index: zml.Tensor,
+        ) LayerCache {
             return .{
                 .k = kv.k.scatterSlices(.{ .layer = layer_index, .k = token_index }, new_k.convert(kv.k.dtype()).transpose(kv.k.shape().drop(.layer)), .{ .indices_are_sorted = true, .update_fn = zml.Tensor.ScatterOpts.override }).reuseBuffer(kv.k),
                 .v = kv.v.scatterSlices(.{ .layer = layer_index, .k = token_index }, new_v.convert(kv.v.dtype()).transpose(kv.v.shape().drop(.layer)), .{ .indices_are_sorted = true, .update_fn = zml.Tensor.ScatterOpts.override }).reuseBuffer(kv.v),
