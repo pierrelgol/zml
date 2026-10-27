@@ -304,7 +304,6 @@ pub const TextModel = struct {
         kv_cache: KvCache,
         moe_backend: zml.moe.Backend,
     ) struct { zml.Tensor, KvCache } {
-        // HF casts embed_scale to the weight dtype before multiplying.
         var hidden = self.embed_tokens.forward(tokens)
             .scale(self.embed_scale)
             .withPartitioning(.model, .{ .d = .replicated });
@@ -444,7 +443,6 @@ pub const TransformerLayer = struct {
         kv_cache: KvCache,
     };
 
-    /// hidden: {.s, .d} -> {.s, .d}
     pub fn forward(input: Input) Output {
         const self = input.layer;
         const x0 = input.hidden.withPartitioning(.model, .{ .d = .replicated });
@@ -457,7 +455,6 @@ pub const TransformerLayer = struct {
         );
         const x1 = x0.add(self.post_attention_layernorm.forward(attn));
 
-        // The dense MLP and the MoE both read the post-attention residual and are summed.
         const dense = self.post_feedforward_layernorm_1.forward(self.mlp.forward(self.pre_feedforward_layernorm.forward(x1)));
         const routing = self.router.forward(x1);
         const sparse = self.post_feedforward_layernorm_2.forward(
@@ -841,7 +838,11 @@ pub const KvCache = struct {
         v: zml.Tensor,
 
         pub fn init(kv_shape: zml.Shape, mesh: *const zml.Mesh) LayerCache {
-            const sharded_shape = kv_shape.withPartitioning(mesh, .{ .h = .model });
+            const partitions = mesh.numPartitionsForLogicalAxis(.model);
+            const sharded_shape = if (@rem(kv_shape.dim(.h), partitions) == 0)
+                kv_shape.withPartitioning(mesh, .{ .h = .model })
+            else
+                kv_shape.withPartitioning(mesh, .{ .h = .replicated });
 
             return .{
                 .k = .fromShape(sharded_shape),
