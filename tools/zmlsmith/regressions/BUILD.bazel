@@ -1,0 +1,37 @@
+load("@rules_zig//zig:defs.bzl", "zig_test")
+
+# Passing regression tests: `generated.zig` is written by `zmlsmith emit-batch` to check
+# the emitters, other files are reduced failures that have been fixed.
+zig_test(
+    name = "test",
+    srcs = glob(["*.zig"]) + ["found/hf_fixture.zig"],
+    main = "regressions.zig",
+    deps = ["//zml"],
+)
+
+# Reproducers of open bugs found by zmlsmith, one test per file since most of them panic.
+# Expected to fail until the bugs are fixed; move a file to this directory's root once it
+# passes. Run them all with `bazel test //tools/zmlsmith/regressions:found --keep_going`.
+# found/hf_fixture.zig is the local huggingface.co stand-in shared by the hf_* files; they
+# need python3 on the host.
+FOUND = glob(
+    ["found/*.zig"],
+    exclude = ["found/hf_fixture.zig"],
+)
+
+[
+    zig_test(
+        name = "found_" + f[len("found/"):-len(".zig")],
+        srcs = ["found/hf_fixture.zig"] if f.startswith("found/hf_") else [],
+        main = f,
+        tags = ["manual"],
+        deps = ["//zml"],
+    )
+    for f in FOUND
+]
+
+test_suite(
+    name = "found",
+    tags = ["manual"],
+    tests = ["found_" + f[len("found/"):-len(".zig")] for f in FOUND],
+)

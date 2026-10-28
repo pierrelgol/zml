@@ -1,0 +1,21 @@
+load("@rules_zig//zig:defs.bzl", "zig_binary", "zig_test")
+
+SRCS = glob([
+    "*.zig",
+    "ops/*.zig",
+])
+
+zig_binary(
+    name = "zmlsmith",
+    srcs = SRCS,
+    main = "main.zig",
+    visibility = ["//visibility:public"],
+    deps = ["//zml"],
+)
+
+zig_test(
+    name = "test",
+    srcs = SRCS,
+    main = "main.zig",
+    deps = ["//zml"],
+)
