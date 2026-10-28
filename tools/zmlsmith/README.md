@@ -5,10 +5,26 @@ generates valid ZML programs, runs them on a platform, and compares every result
 an independent reference interpreter. Failures are deduplicated, reduced automatically
 and turned into standalone Zig regression tests.
 
+## Quick start
+
 ```
+# build and run the unit tests
 bazel build //tools/zmlsmith
+bazel test //tools/zmlsmith:test
+
+# fuzz 2000 seeds on 12 workers; summary in /tmp/zs/summary.txt, and one directory per
+# failure signature with seed-N.zs, reduced.zs and reduced_test.zig
 bazel-bin/tools/zmlsmith/zmlsmith fuzz --seed 1 --count 2000 --jobs 12 --out /tmp/zs
+
+# replay a failure (-v prints the program)
+bazel-bin/tools/zmlsmith/zmlsmith repro -v /tmp/zs/<signature>/reduced.zs
+
+# run the regression tests
+bazel test //tools/zmlsmith/regressions:test
 ```
+
+The findings so far are summarized in `zmlsmith-findings-report.pdf`. All commands are
+listed under [Commands](#commands).
 
 ## How it works
 
