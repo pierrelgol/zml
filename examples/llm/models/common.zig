@@ -76,7 +76,11 @@ pub const Meshes = struct {
 };
 
 pub fn parseConfig(comptime T: type, allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !std.json.Parsed(T) {
-    const file = try dir.openFile(io, "config.json", .{});
+    return parseJsonFile(T, allocator, io, dir, "config.json");
+}
+
+pub fn parseJsonFile(comptime T: type, allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !std.json.Parsed(T) {
+    const file = try dir.openFile(io, path, .{});
     defer file.close(io);
 
     var buffer: [256]u8 = undefined;

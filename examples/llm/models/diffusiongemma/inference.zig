@@ -2,6 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const zml = @import("zml");
 const moe = zml.moe;
+const nn = zml.nn;
 
 const common = @import("../common.zig");
 const encoder = @import("encoder.zig");
@@ -9,8 +10,6 @@ const LoadedModel = @import("LoadedModel.zig");
 const Model = @import("Model.zig");
 
 const log = std.log.scoped(.diffusiongemma);
-
-pub const num_candidates = 5;
 
 pub const CompiledModel = struct {
     loaded_model: *const LoadedModel,
@@ -25,6 +24,7 @@ pub const CompiledModel = struct {
 pub const Shapes = struct {
     seqlen: u32,
     moe_backend: moe.Backend,
+    sampling: nn.SamplingStrategy,
     meshes: common.Meshes,
 };
 
@@ -34,19 +34,24 @@ pub const Prefill = struct {
 
         tokens: zml.Tensor,
         len: zml.Tensor,
+        rng: zml.Tensor.Rng,
+        sampling: nn.SamplingStrategy,
         moe_backend: moe.Backend,
     };
 
-    pub const Output = struct { candidates: zml.Tensor, probabilities: zml.Tensor };
+    pub const Output = struct { token: zml.Tensor, rng: zml.Tensor.Rng };
 
     pub fn forward(input: Input) Output {
         const stack = input.weights.stack;
         const hidden = encoder.forward(stack, input.tokens, input.moe_backend);
 
         const last = hidden.slice(.s, .dyn(input.len.convert(.i32).addConstant(-1), 1));
-        const probabilities = stack.logits(last).softmax(.voc);
-        const best = probabilities.topK(.{ .topk = .voc }, num_candidates, .{});
-        return .{ .candidates = best.indices.convert(.u32), .probabilities = best.values };
+        const token, const rng = nn.sampleTokens(stack.logits(last), input.sampling, input.rng);
+        return .{
+            .token = token.convert(.u32),
+
+            .rng = .{ ._state = rng._state.reuseBuffer(input.rng._state) },
+        };
     }
 };
 
@@ -73,6 +78,8 @@ pub fn compile(
         .weights = loaded_model.model,
         .tokens = .init(.{ .s = shapes.seqlen }, .u32),
         .len = .init(.{}, .u32),
+        .rng = zml.Tensor.Rng.init(),
+        .sampling = shapes.sampling,
         .moe_backend = shapes.moe_backend,
     });
 

@@ -4,42 +4,52 @@ const mem = std.mem;
 const time = std.time;
 const zml = @import("zml");
 const attention = zml.attention;
-const Io = std.Io;
 const moe = zml.moe;
-const TensorStore = zml.io.TensorStore;
+const nn = zml.nn;
+
+const zml_io = zml.io;
+const zml_mem = zml.mem;
 
 const common = @import("../common.zig");
 const Buffers = @import("../diffusiongemma.zig").Buffers;
 const Config = @import("Config.zig");
 const Generation = @import("Generation.zig");
-const Model = @import("Model.zig");
 const inference = @import("inference.zig");
-const log = std.log.scoped(.diffusiongemma_loaded_model);
-pub const LoadedModel = @This();
+const Model = @import("Model.zig");
+
+const log = std.log.scoped(.diffusiongemma);
+
+const LoadedModel = @This();
 
 model: Model,
+
+sampling: nn.SamplingStrategy,
 parsed_config: json.Parsed(Config),
 parsed_generation: json.Parsed(Generation),
 
-pub fn init(allocator: mem.Allocator, io: std.Io, repo: Io.Dir, store: TensorStore.View, options: common.GenerationOptions) !LoadedModel {
-    _ = options;
-
+pub fn init(
+    allocator: mem.Allocator,
+    io: std.Io,
+    repo: std.Io.Dir,
+    store: zml_io.TensorStore.View,
+    options: common.GenerationOptions,
+) !LoadedModel {
     const parsed_config = try common.parseConfig(Config, allocator, io, repo);
     errdefer parsed_config.deinit();
     try parsed_config.value.validate();
 
-    const parsed_generation = try common.parseConfig(Generation, allocator, io, repo);
+    const parsed_generation = try common.parseJsonFile(Generation, allocator, io, repo, "generation_config.json");
     errdefer parsed_generation.deinit();
     try parsed_generation.value.validate();
 
-    const loaded_model: LoadedModel = .{
+    const loaded: LoadedModel = .{
         .model = try .init(allocator, store, parsed_config.value),
+        .sampling = options.sampling_strategy,
         .parsed_config = parsed_config,
         .parsed_generation = parsed_generation,
     };
-
-    loaded_model.logModelInfo();
-    return loaded_model;
+    loaded.logSummary();
+    return loaded;
 }
 
 pub fn deinit(self: *LoadedModel, allocator: mem.Allocator) void {
@@ -56,35 +66,27 @@ pub fn generation(self: *const LoadedModel) Generation {
     return self.parsed_generation.value;
 }
 
-pub fn logModelInfo(self: *const LoadedModel) void {
+fn logSummary(self: LoadedModel) void {
     const model_config = self.config();
-    const model_text_config = self.config().text_config;
-    const model_generation = self.generation();
-
-    log.info("Text stack | Total Layers : {d} | Sliding Attention : {d} of size : {d}| Full Attention : {d} | Hidden size : {d}", .{
-        model_text_config.num_hidden_layers,
+    const text = model_config.text_config;
+    log.info("Text stack: {d} layers ({d} sliding, window {d}, and {d} full), hidden size {d}", .{
+        text.num_hidden_layers,
         model_config.countLayers(.sliding_attention),
-        model_text_config.sliding_window,
+        text.sliding_window,
         model_config.countLayers(.full_attention),
-        model_text_config.hidden_size,
+        text.hidden_size,
     });
-
-    log.info("Attention | Querry Heads : {d} | {d}/{d} key-value heads (sliding/full) | Head Dimension : {d}/{d}", .{
-        model_text_config.num_attention_heads,
-        model_text_config.num_key_value_heads,
-        model_text_config.num_global_key_value_heads,
-        model_text_config.head_dim,
-        model_text_config.global_head_dim,
+    log.info("Attention: {d} query heads, {d}/{d} key-value heads (sliding/full), head dim {d}/{d}", .{
+        text.num_attention_heads,
+        text.num_key_value_heads,
+        text.num_global_key_value_heads,
+        text.head_dim,
+        text.global_head_dim,
     });
-
-    log.info("Experts | {d} Per layer | {d} Active per token | Vocabulary size : {d}", .{
-        model_text_config.num_experts,
-        model_text_config.top_k_experts,
-        model_text_config.vocab_size,
-    });
-
-    log.info("Generation | Eos_token_id(s) : {any}", .{
-        model_generation.eos_token_id,
+    log.info("Experts: {d} per layer, {d} active per token, vocabulary of {d} tokens", .{
+        text.num_experts,
+        text.top_k_experts,
+        text.vocab_size,
     });
 }
 
@@ -93,16 +95,16 @@ pub fn loadBuffers(
     allocator: mem.Allocator,
     io: std.Io,
     platform: *const zml.Platform,
-    store: *zml.io.TensorStore,
+    store: *zml_io.TensorStore,
     progress: *std.Progress.Node,
 ) !Buffers {
     progress.increaseEstimatedTotalItems(store.view().count());
     const started: std.Io.Timestamp = .now(io, .awake);
 
-    var buffers = try zml.mem.bufferize(allocator, Model, &self.model);
+    var buffers = try zml_mem.bufferize(allocator, Model, &self.model);
     errdefer self.unloadBuffers(&buffers, allocator);
 
-    var loader: zml.io.Loader = try .init(allocator, platform, .{
+    var loader: zml_io.Loader = try .init(allocator, platform, .{
         .dma_chunks = 32,
         .dma_chunk_size = 256 * zml.MiB,
         .parallelism = 16,
@@ -117,13 +119,13 @@ pub fn loadBuffers(
     const seconds = @as(f64, @floatFromInt(took.nanoseconds)) / time.ns_per_s;
     const bytes_per_second: u64 = @intFromFloat(@as(f64, @floatFromInt(total_bytes)) / seconds);
     log.info("Loaded weights [{Bi:.2}, {f}, {Bi:.2}/s]", .{ total_bytes, took, bytes_per_second });
-
     return buffers;
 }
 
 pub fn unloadBuffers(self: *const LoadedModel, buffers: *Buffers, allocator: mem.Allocator) void {
     _ = self;
     zml.Buffer.freeDeviceMemoryButKeepHostMetadataMemory(Model, buffers);
+
     allocator.free(buffers.stack.layers);
 }
 
@@ -137,14 +139,15 @@ pub fn compile(
     seqlen: usize,
     progress: *std.Progress.Node,
 ) !inference.CompiledModel {
-    _ = backend; // autofix
+    _ = backend;
     const experts_dtype = self.model.stack.layers[0].experts.gate_up_proj.dtype();
     const moe_backend = moe.Backend.auto(platform, null, experts_dtype) catch .stablehlo;
-    log.info("moe backend : {}", .{moe_backend});
+    log.info("Selected MoE backend: {}", .{moe_backend});
 
     return inference.compile(allocator, io, platform, self, .{
         .seqlen = @intCast(seqlen),
         .moe_backend = moe_backend,
+        .sampling = self.sampling,
         .meshes = meshes,
     }, progress);
 }

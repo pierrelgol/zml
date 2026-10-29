@@ -3,38 +3,33 @@ const math = std.math;
 const zml = @import("zml");
 const moe = zml.moe;
 const nn = zml.nn;
-const TensorStore = zml.io.TensorStore;
+const zml_io = zml.io;
+
 const Config = @import("Config.zig");
 
-pub fn linear(store: TensorStore.View, partitioning: anytype) nn.Linear {
-    return .init(
-        store.createTensor("weight", .{ .dout, .d }, .model, partitioning),
-        null,
-        .d,
-    );
+pub fn linear(store: zml_io.TensorStore.View, partitioning: anytype) nn.Linear {
+    return .init(store.createTensor("weight", .{ .dout, .d }, .model, partitioning), null, .d);
 }
 
 pub const RmsNorm = struct {
     weight: ?zml.Tensor,
     eps: f32,
 
-    pub fn init(store: TensorStore.View, eps: f32) RmsNorm {
-        return .{
-            .weight = store.createTensor("weight", .{.d}, .model, .{}),
-            .eps = eps,
-        };
+    pub fn init(store: zml_io.TensorStore.View, eps: f32) RmsNorm {
+        return .{ .weight = store.createTensor("weight", .{.d}, .model, .{}), .eps = eps };
     }
 
     pub fn initWithoutScale(eps: f32) RmsNorm {
-        return .{
-            .weight = null,
-            .eps = eps,
-        };
+        return .{ .weight = null, .eps = eps };
     }
 
     pub fn forward(self: RmsNorm, x: zml.Tensor) zml.Tensor {
         const normalized = nn.rmsNorm(x.convert(.f32), -1, self.eps);
-        const weight = self.weight orelse return normalized.convert(x.dtype());
+        if (self.weight == null) {
+            return normalized.convert(x.dtype());
+        }
+
+        const weight = self.weight.?.convert(.f32).withTags(.{x.shape().tag(-1)});
         return normalized.mul(weight.broad(normalized.shape())).convert(x.dtype());
     }
 };
@@ -44,7 +39,7 @@ pub const Mlp = struct {
     up_proj: nn.Linear,
     down_proj: nn.Linear,
 
-    pub fn init(store: TensorStore.View) Mlp {
+    pub fn init(store: zml_io.TensorStore.View) Mlp {
         return .{
             .gate_proj = linear(store.withPrefix("gate_proj"), .{ .dout = .model }),
             .up_proj = linear(store.withPrefix("up_proj"), .{ .dout = .model }),
@@ -65,31 +60,23 @@ pub const Mlp = struct {
 pub const Attention = struct {
     q_proj: nn.Linear,
     k_proj: nn.Linear,
-    // full_attention layers don't need value projection
-    // they reuse the key to proj
+
     v_proj: ?nn.Linear,
     o_proj: nn.Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     v_norm: RmsNorm,
-
     num_heads: u32,
     num_kv_heads: u32,
     rope: nn.RopeOpts,
 
-    pub fn init(store: TensorStore.View, text: Config.Text, kind: Config.LayerType) Attention {
-        const num_kv_heads = text.num_key_value_heads;
-
-        const rope: nn.RopeOpts = switch (kind) {
-            .sliding_attention => .{
-                .layout = .real_im_pass,
-                .scaling = text.rope_parameters.sliding_attention,
-            },
-            .full_attention => .{
-                .layout = .real_pass_im_pass,
-                .scaling = text.rope_parameters.full_attention,
-            },
-        };
+    pub fn init(store: zml_io.TensorStore.View, text: Config.Text, kind: Config.LayerType) Attention {
+        var num_kv_heads = text.num_key_value_heads;
+        var rope: nn.RopeOpts = .{ .layout = .real_im_pass, .scaling = text.rope_parameters.sliding_attention };
+        if (kind == .full_attention) {
+            num_kv_heads = text.num_global_key_value_heads;
+            rope = .{ .layout = .real_pass_im_pass, .scaling = text.rope_parameters.full_attention };
+        }
 
         var v_proj: ?nn.Linear = null;
         if (store.hasKey("v_proj.weight")) {
@@ -110,29 +97,17 @@ pub const Attention = struct {
         };
     }
 
-    const Projected = struct {
-        q: zml.Tensor,
-        k: zml.Tensor,
-        v: zml.Tensor,
-    };
+    pub const Projected = struct { q: zml.Tensor, k: zml.Tensor, v: zml.Tensor };
 
     pub fn project(self: Attention, x: zml.Tensor, positions: zml.Tensor) Projected {
-        const q_heads = .{
-            .h = self.num_heads,
-            .hd = .auto,
-        };
+        const q_heads = .{ .h = self.num_heads, .hd = .auto };
+        const kv_heads = .{ .h = self.num_kv_heads, .hd = .auto };
+        const q = self.q_proj.forward(x, x.dtype()).splitAxis(.dout, q_heads);
+        const k = self.k_proj.forward(x, x.dtype()).splitAxis(.dout, kv_heads);
 
-        const kv_heads = .{
-            .h = self.num_kv_heads,
-            .hd = .auto,
-        };
-
-        const q = self.q_proj.forward(x, x.dtype().splitAxis(.dout, q_heads));
-        const k = self.k_proj.forward(x, x.dtype().splitAxis(.dout, kv_heads));
         var v = k;
-
-        if (self.v_proj) |some| {
-            v = some.forward(x, x.dtype().splitAxis(.dout, kv_heads));
+        if (self.v_proj) |v_proj| {
+            v = v_proj.forward(x, x.dtype()).splitAxis(.dout, kv_heads);
         }
 
         return .{
@@ -143,11 +118,11 @@ pub const Attention = struct {
     }
 
     pub fn attend(self: Attention, q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, visible: zml.Tensor) zml.Tensor {
-        const out = nn.spda(q, k, v, .{
+        const out = nn.sdpa(q, k, v, .{
             .attn_mask = additiveMask(visible, q.dtype()),
+
             .scale = .scalar(1.0, q.dtype()),
         });
-
         const merged = out.merge(.{ .d = .{ .h, .hd } });
         return self.o_proj.forward(merged, q.dtype()).rename(.{ .dout = .d });
     }
@@ -164,12 +139,7 @@ pub const Router = struct {
     per_expert_scale: zml.Tensor,
     top_k: u32,
 
-    pub const Routing = struct {
-        weights: zml.Tensor,
-        indices: zml.Tensor,
-    };
-
-    pub fn init(store: TensorStore.View, text: Config.Text) Router {
+    pub fn init(store: zml_io.TensorStore.View, text: Config.Text) Router {
         return .{
             .norm = .initWithoutScale(text.rms_norm_eps),
             .proj = .init(store.createTensor("proj.weight", .{ .expert, .d }, .model, .{}), null, .d),
@@ -179,22 +149,23 @@ pub const Router = struct {
         };
     }
 
+    pub const Routing = struct {
+        weights: zml.Tensor,
+        indices: zml.Tensor,
+    };
+
     pub fn forward(self: Router, x: zml.Tensor) Routing {
         const inverse_root = 1.0 / @sqrt(@as(f32, @floatFromInt(x.dim(.d))));
         const normalized = self.norm.forward(x);
         const scaled = normalized.mul(self.scale.convert(x.dtype()).broad(x.shape())).scale(inverse_root);
 
-        const probabilities = self.proj.forward(scaled, x.dtype().convert(.f32).softmax(.expert));
+        const probabilities = self.proj.forward(scaled, x.dtype()).convert(.f32).softmax(.expert);
         const best = probabilities.topK(.{ .topk = .expert }, self.top_k, .{});
         const indices = best.indices.convert(.i32);
 
         const weights = best.values.div(best.values.sum(.topk).broad(best.values.shape()));
         const gain = self.per_expert_scale.convert(.f32).gather(.{ .expert = indices }, .{});
-
-        return .{
-            .weights = weights.mul(gain),
-            .indices = indices,
-        };
+        return .{ .weights = weights.mul(gain), .indices = indices };
     }
 };
 
@@ -202,7 +173,7 @@ pub const Experts = struct {
     gate_up_proj: zml.Tensor,
     down_proj: zml.Tensor,
 
-    pub fn init(store: TensorStore.View) Experts {
+    pub fn init(store: zml_io.TensorStore.View) Experts {
         const sharded = .{ .expert = .experts };
         return .{
             .gate_up_proj = store.createTensor("gate_up_proj", .{ .expert, .dout, .d }, .experts, sharded),
@@ -218,13 +189,8 @@ pub const Experts = struct {
             .init(self.gate_up_proj, null, .d),
             .init(self.down_proj, null, .dout),
             backend,
-            .{
-                .activation = .geglu_tanh,
-                .quantize_input = false,
-                .routing_weight_placement = .after_down,
-            },
+            .{ .activation = .geglu_tanh, .quantize_input = false, .routing_weight_placement = .after_down },
         );
-
         return out.rename(.{ .t = .s });
     }
 };

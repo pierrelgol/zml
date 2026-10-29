@@ -1,15 +1,15 @@
 const std = @import("std");
 const mem = std.mem;
 const zml = @import("zml");
-const float = zml.float;
+const floats = zml.floats;
 const nn = zml.nn;
-const TensorStore = zml.io.TensorStore;
+const zml_io = zml.io;
 
 const blocks = @import("blocks.zig");
 const Config = @import("Config.zig");
 const Layer = @import("Layer.zig");
 
-pub const Stack = @This();
+const Stack = @This();
 
 embed_tokens: nn.TokenEmbedding,
 layers: []Layer,
@@ -20,8 +20,8 @@ softcap: f32,
 
 pub fn init(
     allocator: mem.Allocator,
-    store: TensorStore.View,
-    encoder_store: TensorStore.View,
+    store: zml_io.TensorStore.View,
+    encoder_store: zml_io.TensorStore.View,
     text: Config.Text,
 ) !Stack {
     const layers = try allocator.alloc(Layer, text.num_hidden_layers);
@@ -29,14 +29,13 @@ pub fn init(
 
     var layers_seen: std.EnumArray(Config.LayerType, u32) = .initFill(0);
     for (layers, text.layer_types, 0..) |*layer, kind, index| {
-        layer.* = try .init(
+        layer.* = .init(
             store.withPrefix("layers").withLayer(index),
             encoder_store.withPrefix("layers").withLayer(index),
             text,
             kind,
             layers_seen.get(kind),
         );
-
         layers_seen.getPtr(kind).* += 1;
     }
 
@@ -58,7 +57,7 @@ pub fn deinit(self: Stack, allocator: mem.Allocator) void {
 
 pub fn embedScale(self: Stack) f32 {
     const exact = @sqrt(@as(f32, @floatFromInt(self.hidden_size)));
-    return float.BFloat16.fromF32(exact).toF32();
+    return floats.BFloat16.fromF32(exact).toF32();
 }
 
 pub fn embed(self: Stack, tokens: zml.Tensor) zml.Tensor {
