@@ -104,7 +104,7 @@ pub const Router = struct {
     pub fn init(store: TensorStore.View, text: Config.Text) Router {
         return .{
             .norm = .initWithoutScale(text.rms_norm_eps),
-            .proj = .init(store.createTensor("proj.weight", .{ .expert, .d }, .model), .{}, null, .d),
+            .proj = .init(store.createTensor("proj.weight", .{ .expert, .d }, .model, .{}), null, .d),
             .scale = store.createTensor("scale", .{.d}, .model, .{}),
             .per_expert_scale = store.createTensor("per_expert_scale", .{.expert}, .model, .{}),
             .top_k = text.top_k_experts,

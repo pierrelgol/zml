@@ -10,7 +10,7 @@ const Layer = @import("Layer.zig");
 
 pub const Stack = @This();
 
-embed_tokens: nn.TokenEmbeddings,
+embed_tokens: nn.TokenEmbedding,
 layers: []Layer,
 norm: blocks.RmsNorm,
 hidden_size: u32,
@@ -28,7 +28,7 @@ pub fn init(
 
     var layers_seen: std.EnumArray(Config.LayerType, u32) = .initFill(0);
     for (layers, text.layer_types, 0..) |*layer, kind, index| {
-        layer.* = .init(
+        layer.* = try .init(
             store.withPrefix("layers").withLayer(index),
             encoder_store.withPrefix("layers").withLayer(index),
             text,

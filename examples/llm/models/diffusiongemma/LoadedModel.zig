@@ -21,7 +21,6 @@ parsed_config: json.Parsed(Config),
 parsed_generation: json.Parsed(Generation),
 
 pub fn init(allocator: mem.Allocator, io: std.Io, repo: Io.Dir, store: TensorStore.View, options: common.GenerationOptions) !LoadedModel {
-    _ = store;
     _ = options;
 
     const parsed_config = try common.parseConfig(Config, allocator, io, repo);
@@ -115,8 +114,10 @@ pub fn loadBuffers(
     const took = started.untilNow(io, .awake);
     const total_bytes: u64 = loader.bytes_loaded.raw;
     const seconds = @as(f64, @floatFromInt(took.nanoseconds)) / time.ns_per_s;
-    const bytes_per_second: u64 = @intFromFloat(@as(u64, @floatFromInt(total_bytes)) / seconds);
+    const bytes_per_second: u64 = @intFromFloat(@as(f64, @floatFromInt(total_bytes)) / seconds);
     log.info("Loaded weights [{Bi:.2}, {f}, {Bi:.2}/s]", .{ total_bytes, took, bytes_per_second });
+
+    return buffers;
 }
 
 pub fn unloadBuffers(self: *const LoadedModel, buffers: *Buffers, allocator: mem.Allocator) void {
