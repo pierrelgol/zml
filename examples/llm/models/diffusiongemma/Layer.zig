@@ -27,6 +27,7 @@ post_feedforward_layernorm_2: blocks.RmsNorm,
 post_feedforward_layernorm: blocks.RmsNorm,
 
 encoder_scalar: zml.Tensor,
+decoder_scalar: zml.Tensor,
 
 pub fn init(
     store: zml_io.TensorStore.View,
@@ -51,6 +52,7 @@ pub fn init(
         .post_feedforward_layernorm_2 = .init(store.withPrefix("post_feedforward_layernorm_2"), eps),
         .post_feedforward_layernorm = .init(store.withPrefix("post_feedforward_layernorm"), eps),
         .encoder_scalar = encoder_store.createTensor("layer_scalar", .{.one}, .model, .{}),
+        .decoder_scalar = store.createTensor("layer_scalar", .{.one}, .model, .{}),
     };
 }
 

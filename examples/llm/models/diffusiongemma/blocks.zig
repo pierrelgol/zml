@@ -72,10 +72,21 @@ pub const Attention = struct {
 
     pub fn init(store: zml_io.TensorStore.View, text: Config.Text, kind: Config.LayerType) Attention {
         var num_kv_heads = text.num_key_value_heads;
-        var rope: nn.RopeOpts = .{ .layout = .real_im_pass, .scaling = text.rope_parameters.sliding_attention };
+
+        const rope: nn.RopeOpts = switch (kind) {
+            .sliding_attention => .{
+                .layout = .real_im_pass,
+                .scaling = text.rope_parameters.sliding_attention,
+            },
+
+            .full_attention => .{
+                .layout = .real_pass_im_pass,
+                .scaling = text.rope_parameters.full_attention,
+            },
+        };
+
         if (kind == .full_attention) {
             num_kv_heads = text.num_global_key_value_heads;
-            rope = .{ .layout = .real_pass_im_pass, .scaling = text.rope_parameters.full_attention };
         }
 
         var v_proj: ?nn.Linear = null;
@@ -97,7 +108,11 @@ pub const Attention = struct {
         };
     }
 
-    pub const Projected = struct { q: zml.Tensor, k: zml.Tensor, v: zml.Tensor };
+    pub const Projected = struct {
+        q: zml.Tensor,
+        k: zml.Tensor,
+        v: zml.Tensor,
+    };
 
     pub fn project(self: Attention, x: zml.Tensor, positions: zml.Tensor) Projected {
         const q_heads = .{ .h = self.num_heads, .hd = .auto };

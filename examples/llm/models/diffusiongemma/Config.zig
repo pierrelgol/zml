@@ -3,6 +3,7 @@ const nn = zml.nn;
 
 const Config = @This();
 
+canvas_length: u32,
 text_config: Text,
 
 pub const LayerType = enum { sliding_attention, full_attention };
@@ -34,6 +35,9 @@ pub const Text = struct {
 
 pub fn validate(self: Config) !void {
     const text = self.text_config;
+    if (self.canvas_length == 0) {
+        return error.InvalidConfig;
+    }
     if (text.layer_types.len != text.num_hidden_layers) {
         return error.InvalidConfig;
     }

@@ -5,7 +5,6 @@ const time = std.time;
 const zml = @import("zml");
 const attention = zml.attention;
 const moe = zml.moe;
-const nn = zml.nn;
 
 const zml_io = zml.io;
 const zml_mem = zml.mem;
@@ -15,15 +14,15 @@ const Buffers = @import("../diffusiongemma.zig").Buffers;
 const Config = @import("Config.zig");
 const Generation = @import("Generation.zig");
 const inference = @import("inference.zig");
+const KvCache = @import("KvCache.zig");
 const Model = @import("Model.zig");
+const sampler = @import("sampler.zig");
 
 const log = std.log.scoped(.diffusiongemma);
 
 const LoadedModel = @This();
 
 model: Model,
-
-sampling: nn.SamplingStrategy,
 parsed_config: json.Parsed(Config),
 parsed_generation: json.Parsed(Generation),
 
@@ -34,6 +33,8 @@ pub fn init(
     store: zml_io.TensorStore.View,
     options: common.GenerationOptions,
 ) !LoadedModel {
+    _ = options;
+
     const parsed_config = try common.parseConfig(Config, allocator, io, repo);
     errdefer parsed_config.deinit();
     try parsed_config.value.validate();
@@ -44,7 +45,6 @@ pub fn init(
 
     const loaded: LoadedModel = .{
         .model = try .init(allocator, store, parsed_config.value),
-        .sampling = options.sampling_strategy,
         .parsed_config = parsed_config,
         .parsed_generation = parsed_generation,
     };
@@ -144,10 +144,14 @@ pub fn compile(
     const moe_backend = moe.Backend.auto(platform, null, experts_dtype) catch .stablehlo;
     log.info("Selected MoE backend: {}", .{moe_backend});
 
+    const dtype = self.model.stack.embed_tokens.weight.dtype();
     return inference.compile(allocator, io, platform, self, .{
         .seqlen = @intCast(seqlen),
+        .canvas_length = self.config().canvas_length,
+        .hidden_size = self.config().text_config.hidden_size,
+        .kv_cache = .init(self.config(), @intCast(seqlen), dtype, meshes.model),
+        .settings = .init(self.generation()),
         .moe_backend = moe_backend,
-        .sampling = self.sampling,
         .meshes = meshes,
     }, progress);
 }
