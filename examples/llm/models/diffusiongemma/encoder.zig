@@ -9,61 +9,42 @@ const Stack = @import("Stack.zig");
 pub fn forward(
     stack: Stack,
     tokens: zml.Tensor,
-    start: zml.Tensor,
-    cache: KvCache,
     backend: moe.Backend,
 ) struct { zml.Tensor, KvCache } {
     var x = stack.embed(tokens);
-    var updated = cache;
 
     for (stack.layers) |layer| {
-        x, updated = block(layer, x, start, updated, stack.sliding_window, backend);
+        x = block(layer, x, stack.sliding_window, backend);
     }
 
-    return .{ stack.norm.forward(x), updated.reuseBuffer(cache) };
+    return stack.norm.forward(x);
 }
 
-pub fn block(
-    layer: Layer,
-    x: zml.Tensor,
-    start: zml.Tensor,
-    cache: KvCache,
-    window: u32,
-    backend: moe.Backend,
-) struct { zml.Tensor, KvCache } {
-    const attn, const updated = attention(layer, layer.input_layernorm.forward(x), start, cache, window);
+pub fn block(layer: Layer, x: zml.Tensor, window: u32, backend: moe.Backend) struct { zml.Tensor, KvCache } {
+    const attn, const updated = attention(layer, layer.input_layernorm.forward(x), window);
+
     return .{
         layer.feedForward(x, attn, layer.encoder_scalar, backend),
         updated,
     };
 }
 
-pub fn attention(
-    layer: Layer,
-    hidden: zml.Tensor,
-    start: zml.Tensor,
-    cache: KvCache,
-    window: u32,
-) struct { zml.Tensor, KvCache } {
+pub fn attention(layer: Layer, hidden: zml.Tensor, window: u32) zml.Tensor {
     const len = hidden.dim(.s);
-    const positions = Stack.positions(start, len);
+    const positions = Stack.positions(zml.Tensor.scale(0, .i32), len);
     const projected = layer.self_attn.project(hidden, positions);
 
-    const pool = cache.pool(layer.kind).write(layer.cache_index, projected.k, projected.v, start);
-    const k, const v = pool.read(layer.cache_index, start.convert(.i32).addConstant(len));
+    const q = projected.q.rename(.{ .s = .q });
+    const k = projected.k.rename(.{ .s = .k });
+    const v = projected.v.rename(.{ .s = .k });
 
-    const visible = causalMask(layer.kind, positions.rename(.{ .s = .q }), k.dim(.k), window);
-    const attn = layer.self_attn.attend(projected.q.rename(.{ .s = .q }), k, v, visible);
-
-    return .{
-        attn.rename(.{ .q = .s }),
-        cache.withPool(layer.kind, pool),
-    };
+    const visible = causalMask(layer.kind, len, window);
+    return layer.self_attn.attend(q, k, v, visible);
 }
 
-fn causalMask(kind: Config.LayerType, query_positions: zml.Tensor, num_slots: i64, window: u32) zml.Tensor {
-    const shape = zml.Shape.init(.{ .q = query_positions.dim(.q), .k = num_slots }, .i32);
-    const query = query_positions.broad(shape);
+fn causalMask(kind: Config.LayerType, len: i64, window: i32) zml.Tensor {
+    const shape = zml.Shape.init(.{ .q = len, .k = len }, .i32);
+    const query = zml.Tensor.iota(shape, .q);
     const key = zml.Tensor.iota(shape, .k);
     var visible = key.cmp(.LE, query);
 
