@@ -1,5 +1,6 @@
 const std = @import("std");
 const zml = @import("zml");
+const moe = zml.moe;
 const blocks = @import("blocks.zig");
 const Config = @import("Config.zig");
 const TensorStore = zml.io.TensorStore;
@@ -50,4 +51,19 @@ pub fn init(
         .post_feedforward_layernorm = .init(store.withPrefix("post_feedforward_layernorm"), epsilon),
         .encoder_scalar = encoder_store.createTensor("layer_scalar", .{.one}, .model, .{}),
     };
+}
+
+pub fn feedForward(self: Layer, x: zml.Tensor, attn: zml.Tensor, layer_scalar: zml.Tensor, backend: moe.Backend) zml.Tensor {
+    const residual = x.add(self.post_attention_layernorm.forward(attn));
+
+    const dense = self.post_feedforward_layernorm_1.forward(
+        self.mlp.forward(self.pre_feedforward_layernorm.forward(residual)),
+    );
+
+    const routing = self.router.forward(residual);
+    const experts_in = self.pre_feedforward_layernorm_2.forward(residual);
+
+    const sparse = self.post_feedforward_layernorm_2.forward(self.experts.forward(experts_in, routing, backend));
+    const out = residual.add(self.post_feedforward_layernorm.forward(dense.add(sparse)));
+    return out.mul(layer_scalar.convert(out.dtype()).squeeze(.one).broad(out.shape()));
 }

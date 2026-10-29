@@ -1,5 +1,7 @@
 const std = @import("std");
+const math = std.math;
 const zml = @import("zml");
+const moe = zml.moe;
 const nn = zml.nn;
 const TensorStore = zml.io.TensorStore;
 const Config = @import("Config.zig");
@@ -29,6 +31,12 @@ pub const RmsNorm = struct {
             .eps = eps,
         };
     }
+
+    pub fn forward(self: RmsNorm, x: zml.Tensor) zml.Tensor {
+        const normalized = nn.rmsNorm(x.convert(.f32), -1, self.eps);
+        const weight = self.weight orelse return normalized.convert(x.dtype());
+        return normalized.mul(weight.broad(normalized.shape())).convert(x.dtype());
+    }
 };
 
 pub const Mlp = struct {
@@ -42,6 +50,15 @@ pub const Mlp = struct {
             .up_proj = linear(store.withPrefix("up_proj"), .{ .dout = .model }),
             .down_proj = linear(store.withPrefix("down_proj"), .{ .d = .model }),
         };
+    }
+
+    pub fn forward(self: Mlp, x: zml.Tensor) zml.Tensor {
+        const gate = self.gate_proj.forward(x, x.dtype());
+        const up = self.up_proj.forward(x, x.dtype());
+
+        const activated = gate.convert(.f32).gelu().convert(x.dtype());
+        const hidden = activated.mul(up).rename(.{ .dout = .d });
+        return self.down_proj.forward(hidden, x.dtype()).rename(.{ .dout = .d });
     }
 };
 

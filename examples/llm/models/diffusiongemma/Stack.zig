@@ -1,6 +1,7 @@
 const std = @import("std");
 const mem = std.mem;
 const zml = @import("zml");
+const float = zml.float;
 const nn = zml.nn;
 const TensorStore = zml.io.TensorStore;
 
@@ -53,4 +54,24 @@ pub fn init(
 
 pub fn deinit(self: Stack, allocator: mem.Allocator) void {
     allocator.free(self.layers);
+}
+
+pub fn embedScale(self: Stack) f32 {
+    const exact = @sqrt(@as(f32, @floatFromInt(self.hidden_size)));
+    return float.BFloat16.fromF32(exact).toF32();
+}
+
+pub fn embed(self: Stack, tokens: zml.Tensor) zml.Tensor {
+    const rows = self.embed_tokens.forward(tokens);
+    return rows.mul(zml.Tensor.scalar(self.embedScale(), rows.dtype()).broad(rows.shape()));
+}
+
+pub fn logits(self: Stack, hidden: zml.Tensor) zml.Tensor {
+    const raw = hidden.dot(self.embed_tokens.weight.convert(hidden.dtype()), .d).convert(.f32);
+    return raw.scale(1.0 / self.softcap).tanh().scale(self.softcap);
+}
+
+pub fn positions(start: zml.Tensor, len: i64) zml.Tensor {
+    const offsets = zml.Tensor.arange(.{ .end = len }, .i32).withTags(.{.s});
+    return offsets.add(start.convert(.i32).broad(offsets.shape()));
 }

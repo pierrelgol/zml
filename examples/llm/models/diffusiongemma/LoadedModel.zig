@@ -5,6 +5,7 @@ const time = std.time;
 const zml = @import("zml");
 const attention = zml.attention;
 const Io = std.Io;
+const moe = zml.moe;
 const TensorStore = zml.io.TensorStore;
 
 const common = @import("../common.zig");
@@ -136,14 +137,14 @@ pub fn compile(
     seqlen: usize,
     progress: *std.Progress.Node,
 ) !inference.CompiledModel {
-    _ = allocator;
-    _ = io;
-    _ = platform;
-    _ = backend;
-    _ = meshes;
-    _ = progress;
-    return .{
-        .loaded_model = self,
+    _ = backend; // autofix
+    const experts_dtype = self.model.stack.layers[0].experts.gate_up_proj.dtype();
+    const moe_backend = moe.Backend.auto(platform, null, experts_dtype) catch .stablehlo;
+    log.info("moe backend : {}", .{moe_backend});
+
+    return inference.compile(allocator, io, platform, self, .{
         .seqlen = @intCast(seqlen),
-    };
+        .moe_backend = moe_backend,
+        .meshes = meshes,
+    }, progress);
 }
