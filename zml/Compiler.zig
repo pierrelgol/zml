@@ -983,6 +983,9 @@ fn compileModuleToPjrtExecutable(compiler: *Compiler, opts: Options) !*pjrt.Load
             },
             .metal => {
                 try setXlaOverrideFlag(overrides_map, "xla_gpu_metal_fast_math", false, upb_arena);
+
+                // The metal backend miscompiles fusion with two outputs, silently, producing wrong values
+                try setXlaOverrideFlag(overrides_map, "xla_disable_hlo_passes", "multi_output_fusion", upb_arena);
             },
             .oneapi => {
                 // More efficient for the allgather/broadcast implementation of the collective permute.
