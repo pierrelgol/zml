@@ -1,6 +1,7 @@
 const std = @import("std");
 const json = std.json;
 const mem = std.mem;
+const time = std.time;
 const zml = @import("zml");
 const attention = zml.attention;
 const Io = std.Io;
@@ -10,10 +11,12 @@ const common = @import("../common.zig");
 const Buffers = @import("../diffusiongemma.zig").Buffers;
 const Config = @import("Config.zig");
 const Generation = @import("Generation.zig");
+const Model = @import("Model.zig");
 const inference = @import("inference.zig");
 const log = std.log.scoped(.diffusiongemma_loaded_model);
 pub const LoadedModel = @This();
 
+model: Model,
 parsed_config: json.Parsed(Config),
 parsed_generation: json.Parsed(Generation),
 
@@ -30,6 +33,7 @@ pub fn init(allocator: mem.Allocator, io: std.Io, repo: Io.Dir, store: TensorSto
     try parsed_generation.value.validate();
 
     const loaded_model: LoadedModel = .{
+        .model = try .init(allocator, store, parsed_config.value),
         .parsed_config = parsed_config,
         .parsed_generation = parsed_generation,
     };
@@ -39,7 +43,7 @@ pub fn init(allocator: mem.Allocator, io: std.Io, repo: Io.Dir, store: TensorSto
 }
 
 pub fn deinit(self: *LoadedModel, allocator: mem.Allocator) void {
-    _ = allocator;
+    self.model.deinit(allocator);
     self.parsed_config.deinit();
     self.parsed_generation.deinit();
 }
@@ -92,19 +96,33 @@ pub fn loadBuffers(
     store: *zml.io.TensorStore,
     progress: *std.Progress.Node,
 ) !Buffers {
-    _ = self;
-    _ = allocator;
-    _ = io;
-    _ = platform;
-    _ = store;
-    _ = progress;
-    return .{};
+    progress.increaseEstimatedTotalItems(store.view().count());
+    const started: std.Io.Timestamp = .now(io, .awake);
+
+    var buffers = try zml.mem.bufferize(allocator, Model, &self.model);
+    errdefer self.unloadBuffers(&buffers, allocator);
+
+    var loader: zml.io.Loader = try .init(allocator, platform, .{
+        .dma_chunks = 32,
+        .dma_chunk_size = 256 * zml.MiB,
+        .parallelism = 16,
+    });
+    defer loader.deinit();
+
+    try loader.load(io, Model, &self.model, &buffers, store, .{ .progress = progress });
+    try loader.await(io);
+
+    const took = started.untilNow(io, .awake);
+    const total_bytes: u64 = loader.bytes_loaded.raw;
+    const seconds = @as(f64, @floatFromInt(took.nanoseconds)) / time.ns_per_s;
+    const bytes_per_second: u64 = @intFromFloat(@as(u64, @floatFromInt(total_bytes)) / seconds);
+    log.info("Loaded weights [{Bi:.2}, {f}, {Bi:.2}/s]", .{ total_bytes, took, bytes_per_second });
 }
 
 pub fn unloadBuffers(self: *const LoadedModel, buffers: *Buffers, allocator: mem.Allocator) void {
     _ = self;
-    _ = buffers;
-    _ = allocator;
+    zml.Buffer.freeDeviceMemoryButKeepHostMetadataMemory(Model, buffers);
+    allocator.free(buffers.stack.layers);
 }
 
 pub fn compile(
@@ -123,5 +141,8 @@ pub fn compile(
     _ = backend;
     _ = meshes;
     _ = progress;
-    return .{ .loaded_model = self, .seqlen = @intCast(seqlen) };
+    return .{
+        .loaded_model = self,
+        .seqlen = @intCast(seqlen),
+    };
 }
