@@ -109,7 +109,53 @@ pub const Attention = struct {
             .rope = rope,
         };
     }
+
+    const Projected = struct {
+        q: zml.Tensor,
+        k: zml.Tensor,
+        v: zml.Tensor,
+    };
+
+    pub fn project(self: Attention, x: zml.Tensor, positions: zml.Tensor) Projected {
+        const q_heads = .{
+            .h = self.num_heads,
+            .hd = .auto,
+        };
+
+        const kv_heads = .{
+            .h = self.num_kv_heads,
+            .hd = .auto,
+        };
+
+        const q = self.q_proj.forward(x, x.dtype().splitAxis(.dout, q_heads));
+        const k = self.k_proj.forward(x, x.dtype().splitAxis(.dout, kv_heads));
+        var v = k;
+
+        if (self.v_proj) |some| {
+            v = some.forward(x, x.dtype().splitAxis(.dout, kv_heads));
+        }
+
+        return .{
+            .q = nn.rope(self.q_norm.forward(q), positions, self.rope),
+            .k = nn.rope(self.k_norm.forward(k), positions, self.rope),
+            .v = self.v_norm.forward(v),
+        };
+    }
+
+    pub fn attend(self: Attention, q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, visible: zml.Tensor) zml.Tensor {
+        const out = nn.spda(q, k, v, .{
+            .attn_mask = additiveMask(visible, q.dtype()),
+            .scale = .scalar(1.0, q.dtype()),
+        });
+
+        const merged = out.merge(.{ .d = .{ .h, .hd } });
+        return self.o_proj.forward(merged, q.dtype()).rename(.{ .dout = .d });
+    }
 };
+
+pub fn additiveMask(visible: zml.Tensor, dtype: zml.DataType) zml.Tensor {
+    return visible.select(zml.Tensor.scalar(0, dtype), zml.Tensor.scalar(-math.inf(f32), dtype));
+}
 
 pub const Router = struct {
     norm: RmsNorm,
@@ -118,6 +164,11 @@ pub const Router = struct {
     per_expert_scale: zml.Tensor,
     top_k: u32,
 
+    pub const Routing = struct {
+        weights: zml.Tensor,
+        indices: zml.Tensor,
+    };
+
     pub fn init(store: TensorStore.View, text: Config.Text) Router {
         return .{
             .norm = .initWithoutScale(text.rms_norm_eps),
@@ -125,6 +176,24 @@ pub const Router = struct {
             .scale = store.createTensor("scale", .{.d}, .model, .{}),
             .per_expert_scale = store.createTensor("per_expert_scale", .{.expert}, .model, .{}),
             .top_k = text.top_k_experts,
+        };
+    }
+
+    pub fn forward(self: Router, x: zml.Tensor) Routing {
+        const inverse_root = 1.0 / @sqrt(@as(f32, @floatFromInt(x.dim(.d))));
+        const normalized = self.norm.forward(x);
+        const scaled = normalized.mul(self.scale.convert(x.dtype()).broad(x.shape())).scale(inverse_root);
+
+        const probabilities = self.proj.forward(scaled, x.dtype().convert(.f32).softmax(.expert));
+        const best = probabilities.topK(.{ .topk = .expert }, self.top_k, .{});
+        const indices = best.indices.convert(.i32);
+
+        const weights = best.values.div(best.values.sum(.topk).broad(best.values.shape()));
+        const gain = self.per_expert_scale.convert(.f32).gather(.{ .expert = indices }, .{});
+
+        return .{
+            .weights = weights.mul(gain),
+            .indices = indices,
         };
     }
 };
@@ -139,5 +208,23 @@ pub const Experts = struct {
             .gate_up_proj = store.createTensor("gate_up_proj", .{ .expert, .dout, .d }, .experts, sharded),
             .down_proj = store.createTensor("down_proj", .{ .expert, .d, .dout }, .experts, sharded),
         };
+    }
+
+    pub fn forward(self: Experts, x: zml.Tensor, routing: Router.Routing, backend: moe.Backend) zml.Tensor {
+        const out = moe.forwardMoe(
+            x.rename(.{ .s = .t }),
+            routing.indices.rename(.{ .s = .t }),
+            routing.weights.rename(.{ .s = .t }),
+            .init(self.gate_up_proj, null, .d),
+            .init(self.down_proj, null, .dout),
+            backend,
+            .{
+                .activation = .geglu_tanh,
+                .quantize_input = false,
+                .routing_weight_placement = .after_down,
+            },
+        );
+
+        return out.rename(.{ .t = .s });
     }
 };
