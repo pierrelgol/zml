@@ -10,6 +10,7 @@ pub const Text = struct {
     hidden_size: u32,
     num_hidden_layers: u32,
     num_attention_heads: u32,
+    num_key_value_heads: u32,
     num_global_key_value_heads: u32,
     head_dim: u32,
     global_head_dim: u32,
