@@ -19,6 +19,7 @@ pub const ModelType = enum {
     llama,
     qwen3_5,
     qwen3_5_moe,
+    diffusion_gemma,
 };
 
 const RawConfig = struct {
@@ -30,6 +31,7 @@ pub const LoadedModel = union(ModelType) {
     llama: llama.LoadedModel,
     qwen3_5: qwen3_5.LoadedModel,
     qwen3_5_moe: qwen3_5_moe.LoadedModel,
+    diffusion_gemma: diffusiongemma.LoadedModel,
 
     pub fn load(
         allocator: std.mem.Allocator,
@@ -109,6 +111,7 @@ pub const CompiledModel = struct {
         llama: llama.inference.CompiledModel,
         qwen3_5: qwen3_5.inference.CompiledModel,
         qwen3_5_moe: qwen3_5_moe.inference.CompiledModel,
+        diffusion_gemma: diffusiongemma.inference.CompiledModel,
     };
 
     inner: Inner,
@@ -146,6 +149,7 @@ pub const Buffers = union(ModelType) {
     llama: llama.Buffers,
     qwen3_5: qwen3_5.Buffers,
     qwen3_5_moe: qwen3_5_moe.Buffers,
+    diffusion_gemma: diffusiongemma.Buffers,
 };
 
 pub const Session = struct {
@@ -154,6 +158,7 @@ pub const Session = struct {
         llama: llama.Session,
         qwen3_5: qwen3_5.Session,
         qwen3_5_moe: qwen3_5_moe.Session,
+        diffusion_gemma: diffusiongemma.Session,
     };
 
     inner: Inner,

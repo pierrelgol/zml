@@ -38,7 +38,8 @@ pub fn init(allocator: mem.Allocator, io: std.Io, repo: Io.Dir, store: TensorSto
     return loaded_model;
 }
 
-pub fn deinit(self: *LoadedModel) void {
+pub fn deinit(self: *LoadedModel, allocator: mem.Allocator) void {
+    _ = allocator;
     self.parsed_config.deinit();
     self.parsed_generation.deinit();
 }
@@ -81,4 +82,46 @@ pub fn logModelInfo(self: *const LoadedModel) void {
     log.info("Generation | Eos_token_id(s) : {any}", .{
         model_generation.eos_token_id,
     });
+}
+
+pub fn loadBuffers(
+    self: *const LoadedModel,
+    allocator: mem.Allocator,
+    io: std.Io,
+    platform: *const zml.Platform,
+    store: *zml.io.TensorStore,
+    progress: *std.Progress.Node,
+) !Buffers {
+    _ = self;
+    _ = allocator;
+    _ = io;
+    _ = platform;
+    _ = store;
+    _ = progress;
+    return .{};
+}
+
+pub fn unloadBuffers(self: *const LoadedModel, buffers: *Buffers, allocator: mem.Allocator) void {
+    _ = self;
+    _ = buffers;
+    _ = allocator;
+}
+
+pub fn compile(
+    self: *const LoadedModel,
+    allocator: mem.Allocator,
+    io: std.Io,
+    platform: *const zml.Platform,
+    backend: attention.Backend,
+    meshes: common.Meshes,
+    seqlen: usize,
+    progress: *std.Progress.Node,
+) !inference.CompiledModel {
+    _ = allocator;
+    _ = io;
+    _ = platform;
+    _ = backend;
+    _ = meshes;
+    _ = progress;
+    return .{ .loaded_model = self, .seqlen = @intCast(seqlen) };
 }

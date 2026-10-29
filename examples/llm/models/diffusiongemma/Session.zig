@@ -83,7 +83,7 @@ pub fn tokenId(self: *const Session, text: []const u8) !u32 {
     return self.text_tokenizer.tokenId(text) orelse error.NoSuchToken;
 }
 
-pub fn runPrefil(self: *Session, all_tokens: []const u32) !void {
+pub fn runPrefill(self: *Session, all_tokens: []const u32) !void {
     if (all_tokens.len > self.seqlen) {
         return error.PromptToolLong;
     }
