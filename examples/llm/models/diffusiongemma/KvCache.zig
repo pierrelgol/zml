@@ -2,7 +2,6 @@ const std = @import("std");
 const zml = @import("zml");
 
 const Config = @import("Config.zig");
-
 const KvCache = @This();
 
 sliding: Pool,
@@ -10,19 +9,25 @@ full: Pool,
 
 pub fn init(config: Config, seqlen: u32, dtype: zml.DataType, mesh: *const zml.Mesh) KvCache {
     const text = config.text_config;
+
     const sliding: zml.Shape = .init(.{
         .layer = config.countLayers(.sliding_attention),
         .k = seqlen,
         .h = text.num_key_value_heads,
         .hd = text.head_dim,
     }, dtype);
+
     const full: zml.Shape = .init(.{
         .layer = config.countLayers(.full_attention),
         .k = seqlen,
         .h = text.num_global_key_value_heads,
         .hd = text.global_head_dim,
     }, dtype);
-    return .{ .sliding = .init(sliding, mesh), .full = .init(full, mesh) };
+
+    return .{
+        .sliding = .init(sliding, mesh),
+        .full = .init(full, mesh),
+    };
 }
 
 pub fn pool(self: KvCache, kind: Config.LayerType) Pool {

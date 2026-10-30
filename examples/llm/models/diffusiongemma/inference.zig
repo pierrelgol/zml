@@ -46,11 +46,15 @@ pub const Encode = struct {
         moe_backend: moe.Backend,
     };
 
-    pub const Output = struct { kv_cache: KvCache };
+    pub const Output = struct {
+        kv_cache: KvCache,
+    };
 
     pub fn forward(input: Input) Output {
         _, const kv_cache = encoder.forward(input.weights.stack, input.tokens, input.start, input.kv_cache, input.moe_backend);
-        return .{ .kv_cache = kv_cache };
+        return .{
+            .kv_cache = kv_cache,
+        };
     }
 };
 
@@ -59,7 +63,6 @@ pub const Denoise = struct {
         weights: Model,
         canvas: zml.Tensor,
         history: zml.Tensor,
-
         soft: zml.Tensor,
         start: zml.Tensor,
         step_index: zml.Tensor,
@@ -73,7 +76,6 @@ pub const Denoise = struct {
         canvas: zml.Tensor,
         history: zml.Tensor,
         soft: zml.Tensor,
-
         argmax: zml.Tensor,
         done: zml.Tensor,
         rng: zml.Tensor.Rng,
@@ -81,6 +83,7 @@ pub const Denoise = struct {
 
     pub fn forward(input: Input) Output {
         const weights = input.weights;
+
         const logits = decoder.forward(
             weights.stack,
             weights.self_conditioning,
@@ -90,16 +93,19 @@ pub const Denoise = struct {
             input.kv_cache,
             input.moe_backend,
         );
+
         const noise, const rng = sampler.Noise.draw(input.rng, logits.dim(.s), logits.dim(.voc));
         const next = sampler.step(input.settings, logits, input.history, input.step_index, noise);
+
         return .{
             .canvas = next.canvas.reuseBuffer(input.canvas),
             .history = next.history.reuseBuffer(input.history),
-
             .soft = decoder.softEmbeddings(weights.stack, next.processed).reuseBuffer(input.soft),
             .argmax = next.argmax,
             .done = next.done.convert(.u8),
-            .rng = .{ ._state = rng._state.reuseBuffer(input.rng._state) },
+            .rng = .{
+                ._state = rng._state.reuseBuffer(input.rng._state),
+            },
         };
     }
 };
@@ -126,6 +132,7 @@ pub fn compile(
 
     const encode_prompt = try context.compile(EncodeExe, "encode_prompt", encodeInput(loaded_model, shapes, shapes.seqlen));
     errdefer encode_prompt.deinit();
+
     const encode_canvas = try context.compile(EncodeExe, "encode_canvas", encodeInput(loaded_model, shapes, shapes.canvas_length));
     errdefer encode_canvas.deinit();
 

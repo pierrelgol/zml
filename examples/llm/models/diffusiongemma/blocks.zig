@@ -16,11 +16,17 @@ pub const RmsNorm = struct {
     eps: f32,
 
     pub fn init(store: zml_io.TensorStore.View, eps: f32) RmsNorm {
-        return .{ .weight = store.createTensor("weight", .{.d}, .model, .{}), .eps = eps };
+        return .{
+            .weight = store.createTensor("weight", .{.d}, .model, .{}),
+            .eps = eps,
+        };
     }
 
     pub fn initWithoutScale(eps: f32) RmsNorm {
-        return .{ .weight = null, .eps = eps };
+        return .{
+            .weight = null,
+            .eps = eps,
+        };
     }
 
     pub fn forward(self: RmsNorm, x: zml.Tensor) zml.Tensor {
@@ -115,8 +121,16 @@ pub const Attention = struct {
     };
 
     pub fn project(self: Attention, x: zml.Tensor, positions: zml.Tensor) Projected {
-        const q_heads = .{ .h = self.num_heads, .hd = .auto };
-        const kv_heads = .{ .h = self.num_kv_heads, .hd = .auto };
+        const q_heads = .{
+            .h = self.num_heads,
+            .hd = .auto,
+        };
+
+        const kv_heads = .{
+            .h = self.num_kv_heads,
+            .hd = .auto,
+        };
+
         const q = self.q_proj.forward(x, x.dtype()).splitAxis(.dout, q_heads);
         const k = self.k_proj.forward(x, x.dtype()).splitAxis(.dout, kv_heads);
 
@@ -135,9 +149,9 @@ pub const Attention = struct {
     pub fn attend(self: Attention, q: zml.Tensor, k: zml.Tensor, v: zml.Tensor, visible: zml.Tensor) zml.Tensor {
         const out = nn.sdpa(q, k, v, .{
             .attn_mask = additiveMask(visible, q.dtype()),
-
             .scale = .scalar(1.0, q.dtype()),
         });
+
         const merged = out.merge(.{ .d = .{ .h, .hd } });
         return self.o_proj.forward(merged, q.dtype()).rename(.{ .dout = .d });
     }
@@ -180,7 +194,11 @@ pub const Router = struct {
 
         const weights = best.values.div(best.values.sum(.topk).broad(best.values.shape()));
         const gain = self.per_expert_scale.convert(.f32).gather(.{ .expert = indices }, .{});
-        return .{ .weights = weights.mul(gain), .indices = indices };
+
+        return .{
+            .weights = weights.mul(gain),
+            .indices = indices,
+        };
     }
 };
 
@@ -189,7 +207,10 @@ pub const Experts = struct {
     down_proj: zml.Tensor,
 
     pub fn init(store: zml_io.TensorStore.View) Experts {
-        const sharded = .{ .expert = .experts };
+        const sharded = .{
+            .expert = .experts,
+        };
+
         return .{
             .gate_up_proj = store.createTensor("gate_up_proj", .{ .expert, .dout, .d }, .experts, sharded),
             .down_proj = store.createTensor("down_proj", .{ .expert, .d, .dout }, .experts, sharded),
@@ -204,8 +225,13 @@ pub const Experts = struct {
             .init(self.gate_up_proj, null, .d),
             .init(self.down_proj, null, .dout),
             backend,
-            .{ .activation = .geglu_tanh, .quantize_input = false, .routing_weight_placement = .after_down },
+            .{
+                .activation = .geglu_tanh,
+                .quantize_input = false,
+                .routing_weight_placement = .after_down,
+            },
         );
+
         return out.rename(.{ .t = .s });
     }
 };

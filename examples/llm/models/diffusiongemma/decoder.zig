@@ -29,7 +29,6 @@ pub const SelfConditioning = struct {
 
 pub fn softEmbeddings(stack: Stack, logits: zml.Tensor) zml.Tensor {
     const weight = stack.embed_tokens.weight;
-
     const probabilities = logits.convert(weight.dtype()).convert(.f32).softmax(.voc).convert(weight.dtype());
     const soft = probabilities.dot(weight, .voc);
     return soft.mul(zml.Tensor.scalar(stack.embedScale(), soft.dtype()).broad(soft.shape()));
@@ -69,6 +68,7 @@ pub fn attention(layer: Layer, hidden: zml.Tensor, start: zml.Tensor, cache: KvC
     const v = zml.Tensor.concatenate(&.{ cached_v.convert(dtype), projected.v.rename(.{ .s = .k }) }, .k);
 
     const visible = canvasMask(layer.kind, len, cached_k.dim(.k), start, window);
+
     return layer.self_attn.attend(projected.q.rename(.{ .s = .q }), k, v, visible).rename(.{ .q = .s });
 }
 

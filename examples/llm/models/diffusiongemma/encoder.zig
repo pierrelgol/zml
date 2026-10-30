@@ -15,10 +15,15 @@ pub fn forward(
 ) struct { zml.Tensor, KvCache } {
     var x = stack.embed(tokens);
     var updated = cache;
+
     for (stack.layers) |layer| {
         x, updated = block(layer, x, start, updated, stack.sliding_window, backend);
     }
-    return .{ stack.norm.forward(x), updated.reuseBuffer(cache) };
+
+    return .{
+        stack.norm.forward(x),
+        updated.reuseBuffer(cache),
+    };
 }
 
 pub fn block(
@@ -30,7 +35,11 @@ pub fn block(
     backend: moe.Backend,
 ) struct { zml.Tensor, KvCache } {
     const attn, const updated = attention(layer, layer.input_layernorm.forward(x), start, cache, window);
-    return .{ layer.feedForward(x, attn, layer.encoder_scalar, backend), updated };
+
+    return .{
+        layer.feedForward(x, attn, layer.encoder_scalar, backend),
+        updated,
+    };
 }
 
 pub fn attention(
@@ -49,7 +58,11 @@ pub fn attention(
 
     const visible = causalMask(layer.kind, positions.rename(.{ .s = .q }), k.dim(.k), window);
     const attn = layer.self_attn.attend(projected.q.rename(.{ .s = .q }), k, v, visible);
-    return .{ attn.rename(.{ .q = .s }), cache.withPool(layer.kind, pool) };
+
+    return .{
+        attn.rename(.{ .q = .s }),
+        cache.withPool(layer.kind, pool),
+    };
 }
 
 fn causalMask(kind: Config.LayerType, query_positions: zml.Tensor, num_slots: i64, window: u32) zml.Tensor {
@@ -62,5 +75,6 @@ fn causalMask(kind: Config.LayerType, query_positions: zml.Tensor, num_slots: i6
         const recent = query.sub(key).cmp(.LT, .scalar(window, .i32));
         visible = visible.logical(.AND, recent);
     }
+
     return visible;
 }
