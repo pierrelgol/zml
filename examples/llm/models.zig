@@ -194,6 +194,13 @@ pub const Session = struct {
         };
     }
 
+    pub fn decide(self: *Session, allocator: std.mem.Allocator, request: diffusiongemma.systemone.Request, writer: *std.Io.Writer) !void {
+        return switch (self.inner) {
+            .diffusion_gemma => |*s| diffusiongemma.decision.run(s, allocator, request, writer),
+            else => error.DecisionModeUnsupported,
+        };
+    }
+
     pub fn maxTokens(self: *const Session) u32 {
         return self.seqlen;
     }

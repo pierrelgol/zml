@@ -20,6 +20,7 @@ const Args = struct {
     topk: u32 = 4,
     backend: ?enum { stablehlo, cute, nki, metal } = null,
     profile: bool = false,
+    decision: ?[]const u8 = null,
 
     pub const help =
         \\ Use llm --model=<path> [options]
@@ -33,6 +34,7 @@ const Args = struct {
         \\   --topk=<number>     Top-k sampling cutoff (default: 4)
         \\   --backend=<text>    Attention backend to use ([stablehlo, cute, nki, metal], default: auto-selection)
         \\   --profile           Capture a PJRT profile for non-interactive runs and write a Perfetto trace
+        \\   --decision=<path>   Answer a systemone decision request (JSON file) and print the answers (diffusion_gemma only)
         \\
     ;
 };
@@ -142,6 +144,10 @@ pub fn main(init: std.process.Init) !void {
     //
     // We're ready to go! Let's start a chat...
     //
+    if (args.decision) |path| {
+        return runDecision(allocator, io, platform, tokenizer, compiled_model, &model_buffers, path);
+    }
+
     try printZmlLogo(io, init.environ_map);
 
     const interactive = args.prompt == null;
@@ -173,6 +179,29 @@ pub fn main(init: std.process.Init) !void {
             .profile = args.profile,
         });
     }
+}
+
+fn runDecision(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    platform: *const zml.Platform,
+    tokenizer: zml.tokenizer.Tokenizer,
+    compiled_model: *models.CompiledModel,
+    model_buffers: *models.Buffers,
+    path: []const u8,
+) !void {
+    const systemone = models.diffusiongemma.systemone;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(systemone.max_request_file_size));
+    defer allocator.free(bytes);
+    const request = try systemone.parseRequest(allocator, bytes);
+    defer request.deinit();
+
+    var session = try compiled_model.newSession(allocator, io, platform, model_buffers, tokenizer);
+    defer session.deinit();
+
+    var stdout = std.Io.File.stdout().writerStreaming(io, &.{});
+    try session.decide(allocator, request.value, &stdout.interface);
+    try stdout.interface.flush();
 }
 
 fn loadTokenizer(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, progress: *std.Progress.Node) !zml.tokenizer.Tokenizer {

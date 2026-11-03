@@ -18,12 +18,14 @@ pub const CompiledModel = struct {
     encode_prompt: EncodeExe,
     encode_canvas: EncodeExe,
     denoise: DenoiseExe,
+    read: ReadExe,
     shapes: Shapes,
 
     pub fn deinit(self: *CompiledModel) void {
         self.encode_prompt.deinit();
         self.encode_canvas.deinit();
         self.denoise.deinit();
+        self.read.deinit();
     }
 };
 
@@ -110,8 +112,49 @@ pub const Denoise = struct {
     }
 };
 
+pub const Read = struct {
+    pub const max_labels = 32;
+
+    pub const Input = struct {
+        weights: Model,
+        canvas: zml.Tensor,
+        labels: zml.Tensor,
+        start: zml.Tensor,
+        kv_cache: KvCache,
+        moe_backend: moe.Backend,
+    };
+
+    pub const Output = struct {
+        log_probs: zml.Tensor,
+        entropy: zml.Tensor,
+    };
+
+    pub fn forward(input: Input) Output {
+        const stack = input.weights.stack;
+        const len = input.canvas.dim(.s);
+        const soft = zml.Tensor.scalar(0, .bf16).broad(zml.Shape.init(.{ .s = len, .d = stack.hidden_size }, .bf16));
+
+        const logits = decoder.forward(
+            stack,
+            input.weights.self_conditioning,
+            input.canvas,
+            soft,
+            input.start,
+            input.kv_cache,
+            input.moe_backend,
+        );
+        const log_probs = logits.sub(logits.logSumExp(.voc).broad(logits.shape()));
+
+        return .{
+            .log_probs = log_probs.gather(.{ .voc = input.labels }, .{}),
+            .entropy = sampler.entropy(logits),
+        };
+    }
+};
+
 pub const EncodeExe = zml.FnExe(Encode.forward);
 pub const DenoiseExe = zml.FnExe(Denoise.forward);
+pub const ReadExe = zml.FnExe(Read.forward);
 
 pub fn compile(
     allocator: mem.Allocator,
@@ -148,12 +191,23 @@ pub fn compile(
         .settings = shapes.settings,
         .moe_backend = shapes.moe_backend,
     });
+    errdefer denoise.deinit();
+
+    const read = try context.compile(ReadExe, "read", Read.Input{
+        .weights = loaded_model.model,
+        .canvas = .init(.{ .s = shapes.canvas_length }, .u32),
+        .labels = .init(.{ .s = shapes.canvas_length, .lbl = Read.max_labels }, .u32),
+        .start = .init(.{}, .u32),
+        .kv_cache = shapes.kv_cache,
+        .moe_backend = shapes.moe_backend,
+    });
 
     return .{
         .loaded_model = loaded_model,
         .encode_prompt = encode_prompt,
         .encode_canvas = encode_canvas,
         .denoise = denoise,
+        .read = read,
         .shapes = shapes,
     };
 }

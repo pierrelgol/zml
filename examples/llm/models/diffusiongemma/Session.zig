@@ -15,6 +15,7 @@ const log = std.log.scoped(.diffusiongemma);
 
 const EncodeRunner = inference.EncodeExe.Runner(.{.weights});
 const DenoiseRunner = inference.DenoiseExe.Runner(.{.weights});
+const ReadRunner = inference.ReadExe.Runner(.{.weights});
 
 const Session = @This();
 
@@ -29,6 +30,7 @@ shapes: inference.Shapes,
 encode_prompt: EncodeRunner,
 encode_canvas: EncodeRunner,
 denoise: DenoiseRunner,
+read_runner: ReadRunner,
 
 kv_cache: zml.Bufferized(KvCache),
 
@@ -48,8 +50,15 @@ pub fn init(
 
     var encode_prompt: EncodeRunner = try .init(&compiled.encode_prompt, allocator, .{ .weights = buffers.* });
     errdefer encode_prompt.deinit(allocator);
+
     var encode_canvas: EncodeRunner = try .init(&compiled.encode_canvas, allocator, .{ .weights = buffers.* });
     errdefer encode_canvas.deinit(allocator);
+
+    var denoise: DenoiseRunner = try .init(&compiled.denoise, allocator, .{ .weights = buffers.* });
+    errdefer denoise.deinit(allocator);
+
+    var read_runner: ReadRunner = try .init(&compiled.read, allocator, .{ .weights = buffers.* });
+    errdefer read_runner.deinit(allocator);
 
     const seed: u64 = @intCast(std.Io.Clock.now(.real, io).toNanoseconds());
     var rng = try zml.Tensor.Rng.init().initBuffer(io, platform, seed);
@@ -65,7 +74,8 @@ pub fn init(
         .shapes = compiled.shapes,
         .encode_prompt = encode_prompt,
         .encode_canvas = encode_canvas,
-        .denoise = try .init(&compiled.denoise, allocator, .{ .weights = buffers.* }),
+        .denoise = denoise,
+        .read_runner = read_runner,
         .kv_cache = kv_cache,
         .rng = rng,
         .random = .init(seed),
@@ -76,6 +86,7 @@ pub fn deinit(self: *Session) void {
     self.encode_prompt.deinit(self.allocator);
     self.encode_canvas.deinit(self.allocator);
     self.denoise.deinit(self.allocator);
+    self.read_runner.deinit(self.allocator);
     KvCache.deinitBuffer(&self.kv_cache);
     zml.Tensor.Rng.deinitBuffer(&self.rng);
 }
@@ -113,7 +124,7 @@ fn tokenizeUserTurn(self: *const Session, allocator: mem.Allocator, prefix: []co
     return @ptrCast(@alignCast(try tokens.toOwnedSlice()));
 }
 
-fn tokenId(self: *const Session, text: []const u8) !u32 {
+pub fn tokenId(self: *const Session, text: []const u8) !u32 {
     return self.text_tokenizer.tokenId(text) orelse error.NoSuchToken;
 }
 
@@ -174,9 +185,11 @@ pub fn runDecode(self: *Session, all_tokens: *std.ArrayList(u32), stdout: *std.I
 
 fn denoiseCanvas(self: *Session, start: u32, canvas: []u32) !u32 {
     const vocab_size = self.config.text_config.vocab_size;
+
     for (canvas) |*id| {
         id.* = self.random.random().uintLessThan(u32, vocab_size);
     }
+
     var canvas_buffer = try self.upload(.init(.{canvas.len}, .u32), canvas);
     defer canvas_buffer.deinit();
 
@@ -206,6 +219,7 @@ fn denoiseCanvas(self: *Session, start: u32, canvas: []u32) !u32 {
 
     var steps: u32 = 0;
     var step_index = self.generation.max_denoising_steps;
+
     while (step_index >= 1) : (step_index -= 1) {
         var step_buffer: zml.Buffer = try .scalar(self.io, self.platform, step_index, .u32);
         defer step_buffer.deinit();
@@ -213,9 +227,11 @@ fn denoiseCanvas(self: *Session, start: u32, canvas: []u32) !u32 {
         if (argmax) |*buffer| {
             buffer.deinit();
         }
+
         var next_argmax: zml.Buffer = undefined;
         var done: zml.Buffer = undefined;
         defer done.deinit();
+
         self.denoise.run(self.io, .{
             .inputs = .{
                 .canvas = canvas_buffer,
@@ -235,6 +251,7 @@ fn denoiseCanvas(self: *Session, start: u32, canvas: []u32) !u32 {
                 .rng = &self.rng,
             },
         }, .{});
+
         argmax = next_argmax;
         steps += 1;
 
@@ -247,14 +264,62 @@ fn denoiseCanvas(self: *Session, start: u32, canvas: []u32) !u32 {
     return steps;
 }
 
-fn encode(self: *Session, runner: *EncodeRunner, tokens: []const u32, start: u32) !void {
-    var tokens_buffer = try self.upload(.init(.{tokens.len}, .u32), tokens);
-    defer tokens_buffer.deinit();
+pub fn read(self: *Session, canvas: []const u32, start: u32, labels: []const u32, log_probs: []f32, entropy: []f32) !void {
+    var canvas_buffer = try self.upload(.init(.{canvas.len}, .u32), canvas);
+    defer canvas_buffer.deinit();
+
+    var labels_buffer = try self.upload(.init(.{ canvas.len, inference.Read.max_labels }, .u32), labels);
+    defer labels_buffer.deinit();
+
     var start_buffer: zml.Buffer = try .scalar(self.io, self.platform, start, .u32);
     defer start_buffer.deinit();
 
-    runner.run(self.io, .{
-        .inputs = .{ .tokens = tokens_buffer, .start = start_buffer, .kv_cache = self.kv_cache },
-        .outputs = .{ .kv_cache = &self.kv_cache },
-    }, .{});
+    var log_probs_buffer: zml.Buffer = undefined;
+    defer log_probs_buffer.deinit();
+
+    var entropy_buffer: zml.Buffer = undefined;
+    defer entropy_buffer.deinit();
+
+    self.read_runner.run(
+        self.io,
+        .{
+            .inputs = .{
+                .canvas = canvas_buffer,
+                .labels = labels_buffer,
+                .start = start_buffer,
+                .kv_cache = self.kv_cache,
+            },
+            .outputs = .{
+                .log_probs = &log_probs_buffer,
+                .entropy = &entropy_buffer,
+            },
+        },
+        .{},
+    );
+
+    try log_probs_buffer.toSlice(self.io, .init(log_probs_buffer.shape(), mem.sliceAsBytes(log_probs)));
+    try entropy_buffer.toSlice(self.io, .init(entropy_buffer.shape(), mem.sliceAsBytes(entropy)));
+}
+
+fn encode(self: *Session, runner: *EncodeRunner, tokens: []const u32, start: u32) !void {
+    var tokens_buffer = try self.upload(.init(.{tokens.len}, .u32), tokens);
+    defer tokens_buffer.deinit();
+
+    var start_buffer: zml.Buffer = try .scalar(self.io, self.platform, start, .u32);
+    defer start_buffer.deinit();
+
+    runner.run(
+        self.io,
+        .{
+            .inputs = .{
+                .tokens = tokens_buffer,
+                .start = start_buffer,
+                .kv_cache = self.kv_cache,
+            },
+            .outputs = .{
+                .kv_cache = &self.kv_cache,
+            },
+        },
+        .{},
+    );
 }
