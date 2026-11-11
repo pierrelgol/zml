@@ -92,6 +92,8 @@ pub const Options = struct {
     // Debugging options
     program_name: []const u8 = "zml",
     xla_dump_to: ?[]const u8 = null,
+    /// File receiving the canonicalized module in generic op form, as handed to PJRT.
+    mlir_dump_path: ?[]const u8 = null,
     xla_dump_fusion_visualization: bool = false,
     xla_dump_hlo_pass_re: ?[]const u8 = null,
     xla_dump_emitter_re: ?[]const u8 = null,
@@ -492,6 +494,12 @@ pub fn compileInternal(
             @panic("ZML generated invalid mlir. Please open a bug report");
         },
     };
+
+    if (opts.mlir_dump_path) |mlir_dump_path| {
+        compiler.dumpMlir(io, mlir_dump_path) catch |err| {
+            log.err("failed to dump mlir to {s}: {}", .{ mlir_dump_path, err });
+        };
+    }
 
     const loaded_executable = compiler.compileModuleToPjrtExecutable(opts) catch |err| {
         compiler.handleCompilationError(io, compiler.arena.allocator(), opts, err, "Pjrt failed to compile the following MLIR");
@@ -1041,6 +1049,16 @@ fn compileModuleToPjrtExecutable(compiler: *Compiler, opts: Options) !*pjrt.Load
     errdefer loaded_executable.deinit();
 
     return loaded_executable;
+}
+
+fn dumpMlir(compiler: *Compiler, io: std.Io, path: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    try writer.interface.print("{f}\n", .{compiler.module.operation().fmt(.{ .print_generic_op_form = true })});
+    try writer.interface.flush();
 }
 
 fn handleCompilationError(compiler: *Compiler, io: std.Io, allocator: std.mem.Allocator, opts: Options, err: anyerror, msg: []const u8) void {
