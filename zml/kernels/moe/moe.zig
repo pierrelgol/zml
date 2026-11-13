@@ -4,17 +4,18 @@ const platforms = @import("platforms");
 
 const zml = @import("../../zml.zig");
 const stdx = zml.stdx;
+pub const Activation = @import("api.zig").Activation;
+pub const ActivationKind = @import("api.zig").ActivationKind;
 pub const cute = @import("cute/cute.zig");
-pub const ExpertsLayout = @import("options.zig").ExpertsLayout;
+pub const ExpertsLayout = @import("api.zig").ExpertsLayout;
 pub const flashinfer_cutlass = @import("flashinfer_cutlass/flashinfer_cutlass.zig");
 pub const fly = @import("fly/fly.zig");
+pub const LocalRouting = @import("api.zig").LocalRouting;
 pub const metal = @import("metal/metal.zig");
 pub const mosaic_tpu = @import("mosaic_tpu/mosaic_tpu.zig");
-pub const Options = @import("options.zig").Options;
-pub const Activation = @import("options.zig").Activation;
-pub const ActivationKind = @import("options.zig").ActivationKind;
-pub const ProjectionLayout = @import("options.zig").ProjectionLayout;
-pub const RoutingWeightPlacement = @import("options.zig").RoutingWeightPlacement;
+pub const Options = @import("api.zig").Options;
+pub const ProjectionLayout = @import("api.zig").ProjectionLayout;
+pub const RoutingWeightPlacement = @import("api.zig").RoutingWeightPlacement;
 pub const stablehlo = @import("stablehlo/stablehlo.zig");
 pub const tcl = @import("tcl/tcl.zig");
 pub const triton = @import("triton/triton.zig");
@@ -37,8 +38,6 @@ pub const Backend = enum {
     tcl,
 
     pub fn auto(platform: *const zml.Platform, scheme: ?zml.Quantization.Scheme, dtype: zml.DataType) !Backend {
-        // Keep the dtype as an argument because non scheme-specific backends may depend on it later
-        _ = dtype;
         return switch (platform.target) {
             .cuda => b: {
                 const s = scheme orelse break :b .triton;
@@ -72,7 +71,13 @@ pub const Backend = enum {
                 };
             },
             .tpu => if (scheme == null) .mosaic_tpu else error.UnsupportedQuantization,
-            .furiosa => if (scheme == null) .tcl else error.UnsupportedQuantization,
+            .furiosa => b: {
+                const s = scheme orelse break :b .tcl;
+                break :b switch (s) {
+                    .fp8_block128 => if (dtype == .f8e4m3fn) .tcl else error.UnsupportedQuantization,
+                    .mxfp4, .nvfp4, .mxfp8, .fp8_per_channel, .fp8_per_tensor, .fp8_block32 => error.UnsupportedQuantization,
+                };
+            },
             .metal => b: {
                 const s = scheme orelse break :b .metal;
                 break :b switch (s) {
@@ -131,38 +136,6 @@ pub const Backend = enum {
             .metal => {},
             .tcl => {},
         };
-    }
-};
-
-/// Routing for a local token batch and a contiguous range of experts.
-/// IDs retain the model's global expert numbering, while the projection weights
-/// contain only the local experts. Kernels compute those experts contributions and
-/// `forwardMoe` sums them along the expert axis.
-pub const LocalRouting = struct {
-    /// Global expert IDs for local tokens, with shape {.t, .topk}
-    ids: zml.Tensor,
-    weights: zml.Tensor,
-    global_num_experts: u32,
-    local_num_experts: u32,
-    /// Scalar i32 containing the first local expert's global ID.
-    /// Null when all experts are local and global IDs already index the weights.
-    expert_start: ?zml.Tensor = null,
-
-    /// Maps routing IDs to local weight indices, using -1 for nonlocal experts.
-    /// For a shard owning experts 4–7, routing IDs [1, 6] become [-1, 2].
-    pub fn localIds(self: LocalRouting) zml.Tensor {
-        const start = self.expert_start orelse return self.ids;
-        const local = self.ids.cmp(.GE, start).logical(.AND, self.ids.cmp(.LT, start.addConstant(self.local_num_experts)));
-        return local.select(self.ids.sub(start), .scalar(-1, .i32));
-    }
-
-    /// Returns a lookup table from every global expert ID to its local weight
-    /// index or -1 if nonlocal. Returns null when every expert is local.
-    pub fn expertMap(self: LocalRouting) ?zml.Tensor {
-        const start = self.expert_start orelse return null;
-        const ids = zml.Tensor.arange(.{ .end = self.global_num_experts }, .i32).withTags(.{.expert});
-        const local = ids.cmp(.GE, start).logical(.AND, ids.cmp(.LT, start.addConstant(self.local_num_experts)));
-        return local.select(ids.sub(start), .scalar(-1, .i32));
     }
 };
 
@@ -245,7 +218,7 @@ pub fn forwardMoe(
     }
     const expert_axis = experts.meshAxis();
     const parallel = if (expert_axis) |axis| mesh.grid.axis_sizes[axis] > 1 else false;
-    if (backend == .metal or backend == .tcl) stdx.debug.assert(!parallel, "This MoE backend does not support expert parallelism", .{});
+    if (backend == .metal) stdx.debug.assert(!parallel, "This MoE backend does not support expert parallelism", .{});
 
     const Call = struct {
         input: zml.Tensor,
